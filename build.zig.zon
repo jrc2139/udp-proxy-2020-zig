@@ -1,0 +1,15 @@
+.{
+    .name = .udp_proxy_2020,
+    .version = "1.0.0",
+    .fingerprint = 0x63ef4bd5df3d903c,
+
+    .minimum_zig_version = "0.15.0",
+
+    .dependencies = .{},
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
