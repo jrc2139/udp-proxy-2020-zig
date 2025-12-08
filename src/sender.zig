@@ -1,0 +1,386 @@
+//! Packet sender infrastructure
+//!
+//! Manages the broadcast of packets between interfaces.
+//! Each interface registers a send channel, and packets are
+//! forwarded to all interfaces except the source.
+
+const std = @import("std");
+const pcap = @import("pcap.zig");
+const packet = @import("packet.zig");
+
+const log = std.log.scoped(.sender);
+
+// ============================================================================
+// Types
+// ============================================================================
+
+/// Maximum packet data size
+pub const MAX_PACKET_SIZE = 9000;
+
+/// Packet to be sent to another interface
+pub const SendPacket = struct {
+    /// Raw packet data (copied)
+    data: [MAX_PACKET_SIZE]u8,
+    /// Actual length of packet data
+    len: usize,
+    /// Source interface name
+    src_interface: []const u8,
+    /// Link type of source interface
+    link_type: pcap.LinkType,
+    /// Capture timestamp
+    timestamp_sec: i64,
+    timestamp_usec: i64,
+
+    /// Get the packet data slice
+    pub fn getData(self: *const SendPacket) []const u8 {
+        return self.data[0..self.len];
+    }
+};
+
+/// Simple ring buffer for packets
+const PacketQueue = struct {
+    const QUEUE_SIZE = 256;
+
+    items: [QUEUE_SIZE]SendPacket,
+    read_pos: usize,
+    write_pos: usize,
+    count: usize,
+
+    fn init() PacketQueue {
+        return PacketQueue{
+            .items = undefined,
+            .read_pos = 0,
+            .write_pos = 0,
+            .count = 0,
+        };
+    }
+
+    fn push(self: *PacketQueue, item: SendPacket) bool {
+        if (self.count >= QUEUE_SIZE) {
+            return false; // Queue full
+        }
+        self.items[self.write_pos] = item;
+        self.write_pos = (self.write_pos + 1) % QUEUE_SIZE;
+        self.count += 1;
+        return true;
+    }
+
+    fn pop(self: *PacketQueue) ?SendPacket {
+        if (self.count == 0) {
+            return null;
+        }
+        const item = self.items[self.read_pos];
+        self.read_pos = (self.read_pos + 1) % QUEUE_SIZE;
+        self.count -= 1;
+        return item;
+    }
+};
+
+/// Channel for receiving packets to send
+pub const SendChannel = struct {
+    queue: PacketQueue,
+    mutex: std.Thread.Mutex,
+    cond: std.Thread.Condition,
+    closed: bool,
+
+    pub fn init() SendChannel {
+        return SendChannel{
+            .queue = PacketQueue.init(),
+            .mutex = .{},
+            .cond = .{},
+            .closed = false,
+        };
+    }
+
+    pub fn deinit(_: *SendChannel) void {
+        // Nothing to free
+    }
+
+    /// Send a packet to this channel
+    pub fn send(self: *SendChannel, pkt: SendPacket) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.closed) return error.ChannelClosed;
+
+        if (!self.queue.push(pkt)) {
+            return error.QueueFull;
+        }
+        self.cond.signal();
+    }
+
+    /// Receive a packet from this channel (blocking)
+    pub fn receive(self: *SendChannel) ?SendPacket {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        while (self.queue.count == 0 and !self.closed) {
+            self.cond.wait(&self.mutex);
+        }
+
+        if (self.closed and self.queue.count == 0) {
+            return null;
+        }
+
+        return self.queue.pop();
+    }
+
+    /// Try to receive without blocking
+    pub fn tryReceive(self: *SendChannel) ?SendPacket {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        return self.queue.pop();
+    }
+
+    /// Close the channel
+    pub fn close(self: *SendChannel) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.closed = true;
+        self.cond.broadcast();
+    }
+};
+
+/// Packet feed that manages all send channels
+pub const SendPktFeed = struct {
+    /// Map of interface name to send channel
+    senders: std.StringHashMap(*SendChannel),
+    /// Allocator
+    allocator: std.mem.Allocator,
+    /// Mutex for thread safety
+    mutex: std.Thread.Mutex,
+
+    pub fn init(allocator: std.mem.Allocator) SendPktFeed {
+        return SendPktFeed{
+            .senders = std.StringHashMap(*SendChannel).init(allocator),
+            .allocator = allocator,
+            .mutex = .{},
+        };
+    }
+
+    pub fn deinit(self: *SendPktFeed) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var key_iter = self.senders.keyIterator();
+        while (key_iter.next()) |key| {
+            self.allocator.free(key.*);
+        }
+
+        var value_iter = self.senders.valueIterator();
+        while (value_iter.next()) |channel| {
+            channel.*.close();
+            channel.*.deinit();
+            self.allocator.destroy(channel.*);
+        }
+        self.senders.deinit();
+    }
+
+    /// Register a send channel for an interface
+    pub fn registerSender(self: *SendPktFeed, iface_name: []const u8) !*SendChannel {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Create new channel
+        const channel = try self.allocator.create(SendChannel);
+        channel.* = SendChannel.init();
+
+        // Copy interface name for the key
+        const name_copy = try self.allocator.dupe(u8, iface_name);
+
+        try self.senders.put(name_copy, channel);
+
+        log.debug("Registered sender for interface: {s}", .{iface_name});
+
+        return channel;
+    }
+
+    /// Broadcast a packet to all interfaces except the source
+    pub fn broadcast(
+        self: *SendPktFeed,
+        data: []const u8,
+        src_interface: []const u8,
+        link_type: pcap.LinkType,
+        timestamp_sec: i64,
+        timestamp_usec: i64,
+    ) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (data.len > MAX_PACKET_SIZE) {
+            log.warn("Packet too large to broadcast: {d} bytes", .{data.len});
+            return;
+        }
+
+        var pkt = SendPacket{
+            .data = undefined,
+            .len = data.len,
+            .src_interface = src_interface,
+            .link_type = link_type,
+            .timestamp_sec = timestamp_sec,
+            .timestamp_usec = timestamp_usec,
+        };
+        @memcpy(pkt.data[0..data.len], data);
+
+        var iter = self.senders.iterator();
+        while (iter.next()) |entry| {
+            // Skip the source interface
+            if (std.mem.eql(u8, entry.key_ptr.*, src_interface)) {
+                continue;
+            }
+
+            entry.value_ptr.*.send(pkt) catch |err| {
+                log.warn("Failed to send packet to {s}: {}", .{ entry.key_ptr.*, err });
+            };
+        }
+    }
+
+    /// Get the number of registered senders
+    pub fn count(self: *SendPktFeed) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.senders.count();
+    }
+};
+
+// ============================================================================
+// Packet Modification
+// ============================================================================
+
+/// Build an outgoing packet with modified destination IP
+pub fn buildOutgoingPacket(
+    allocator: std.mem.Allocator,
+    parsed: packet.ParsedPacket,
+    dst_ip: [4]u8,
+    dst_link_type: pcap.LinkType,
+    src_mac: [6]u8,
+) ![]u8 {
+    const original_ipv4 = parsed.ipv4 orelse return error.NoIpv4Header;
+    const original_udp = parsed.udp orelse return error.NoUdpHeader;
+
+    // Calculate sizes
+    const l2_size: usize = switch (dst_link_type) {
+        .ethernet => packet.ETHERNET_HEADER_SIZE,
+        .null, .loop => packet.LOOPBACK_HEADER_SIZE,
+        .raw => 0,
+        else => return error.UnsupportedLinkType,
+    };
+    const ip_header_size = original_ipv4.getHeaderLength();
+    const udp_size = packet.UDP_HEADER_SIZE;
+    const payload_size = parsed.payload.len;
+    const total_size = l2_size + ip_header_size + udp_size + payload_size;
+
+    // Allocate buffer
+    const buffer = try allocator.alloc(u8, total_size);
+    errdefer allocator.free(buffer);
+
+    var builder = packet.PacketBuilder.init(buffer);
+
+    // Add L2 header based on destination link type
+    switch (dst_link_type) {
+        .ethernet => {
+            _ = try builder.addEthernet(src_mac, packet.BROADCAST_MAC, .ipv4);
+        },
+        .null, .loop => {
+            _ = try builder.addLoopback(.ipv4);
+        },
+        .raw => {
+            // No L2 header
+        },
+        else => return error.UnsupportedLinkType,
+    }
+
+    // Add IPv4 header (copy from original but change dst IP)
+    const ipv4 = try builder.addIPv4(
+        original_ipv4.src_ip,
+        dst_ip,
+        original_ipv4.getProtocol(),
+        original_ipv4.ttl,
+    );
+
+    // Copy additional IPv4 fields
+    ipv4.tos = original_ipv4.tos;
+    ipv4.identification = original_ipv4.identification;
+    ipv4.flags_fragment = original_ipv4.flags_fragment;
+
+    // Add UDP header
+    const udp = try builder.addUDP(
+        original_udp.getSrcPort(),
+        original_udp.getDstPort(),
+    );
+
+    // Add payload
+    try builder.addPayload(parsed.payload);
+
+    // Fix up lengths
+    const ip_total_len: u16 = @intCast(ip_header_size + udp_size + payload_size);
+    ipv4.setTotalLength(ip_total_len);
+
+    const udp_len: u16 = @intCast(udp_size + payload_size);
+    udp.setLength(udp_len);
+
+    // Calculate checksums
+    packet.calculateIpChecksum(ipv4);
+    // UDP checksum is left as 0 (valid for UDP)
+
+    return builder.getData();
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "SendPktFeed registration" {
+    const allocator = std.testing.allocator;
+
+    var feed = SendPktFeed.init(allocator);
+    defer feed.deinit();
+
+    _ = try feed.registerSender("eth0");
+    _ = try feed.registerSender("eth1");
+
+    try std.testing.expectEqual(@as(usize, 2), feed.count());
+}
+
+test "SendPacket data copy" {
+    const data = "Hello, World!";
+    var pkt = SendPacket{
+        .data = undefined,
+        .len = data.len,
+        .src_interface = "eth0",
+        .link_type = .ethernet,
+        .timestamp_sec = 0,
+        .timestamp_usec = 0,
+    };
+    @memcpy(pkt.data[0..data.len], data);
+
+    try std.testing.expectEqualStrings(data, pkt.getData());
+}
+
+test "PacketQueue basic operations" {
+    var queue = PacketQueue.init();
+
+    // Queue should be empty initially
+    try std.testing.expect(queue.pop() == null);
+
+    // Push a packet
+    var pkt = SendPacket{
+        .data = undefined,
+        .len = 5,
+        .src_interface = "eth0",
+        .link_type = .ethernet,
+        .timestamp_sec = 0,
+        .timestamp_usec = 0,
+    };
+    @memcpy(pkt.data[0..5], "hello");
+
+    try std.testing.expect(queue.push(pkt));
+    try std.testing.expectEqual(@as(usize, 1), queue.count);
+
+    // Pop the packet
+    const popped = queue.pop();
+    try std.testing.expect(popped != null);
+    try std.testing.expectEqualStrings("hello", popped.?.getData());
+    try std.testing.expectEqual(@as(usize, 0), queue.count);
+}
