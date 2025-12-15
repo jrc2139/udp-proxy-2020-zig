@@ -222,20 +222,37 @@ pub const Listener = struct {
         var last_cleanup = std.time.milliTimestamp();
         const cleanup_interval: i64 = 5000;
 
-        log.debug("{s}: starting packet handler", .{self.config.iface_name});
+        log.debug("{s}: starting packet handler (send_only={})", .{ self.config.iface_name, self.config.send_only });
 
         while (self.running) {
-            // Check for packets to send from other interfaces
-            if (self.send_channel) |channel| {
-                while (channel.tryReceive()) |pkt| {
-                    self.sendPackets(pkt) catch |err| {
-                        log.warn("{s}: failed to send packet: {}", .{ self.config.iface_name, err });
-                    };
+            if (self.config.send_only) {
+                // Send-only mode: block on channel, no pcap capture
+                if (self.send_channel) |channel| {
+                    // Use blocking receive to avoid CPU spin
+                    if (channel.receive()) |pkt| {
+                        self.sendPackets(pkt) catch |err| {
+                            log.warn("{s}: failed to send packet: {}", .{ self.config.iface_name, err });
+                        };
+                    }
+                    // Drain any additional queued packets
+                    while (channel.tryReceive()) |pkt| {
+                        self.sendPackets(pkt) catch |err| {
+                            log.warn("{s}: failed to send packet: {}", .{ self.config.iface_name, err });
+                        };
+                    }
                 }
-            }
+            } else {
+                // Normal mode: capture packets and check send channel
+                // Check for packets to send from other interfaces (non-blocking)
+                if (self.send_channel) |channel| {
+                    while (channel.tryReceive()) |pkt| {
+                        self.sendPackets(pkt) catch |err| {
+                            log.warn("{s}: failed to send packet: {}", .{ self.config.iface_name, err });
+                        };
+                    }
+                }
 
-            // Capture incoming packets (unless send-only)
-            if (!self.config.send_only) {
+                // Capture incoming packets (blocks for up to timeout_ms)
                 if (self.handle) |*handle| {
                     if (handle.nextPacket()) |result| {
                         if (result) |pkt_data| {

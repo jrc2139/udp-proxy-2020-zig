@@ -205,7 +205,7 @@ pub const ClientCache = struct {
 
 /// Format an IP address to string
 fn formatIp(ip: [4]u8) [15]u8 {
-    var buf: [15]u8 = undefined;
+    var buf: [15]u8 = [_]u8{0} ** 15;
     _ = std.fmt.bufPrint(&buf, "{d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] }) catch {};
     return buf;
 }

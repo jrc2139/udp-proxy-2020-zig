@@ -3,12 +3,15 @@
 
 .PHONY: all build release debug test clean install help
 
+# Detect OS
+UNAME_S := $(shell uname -s)
+
 # Default target
 all: release
 
 # Release build (optimized)
 release:
-	zig build -Doptimize=ReleaseFast
+	zig build -Doptimize=ReleaseSmall
 
 # Debug build
 debug:
@@ -26,9 +29,11 @@ clean:
 install: release
 	install -m 755 zig-out/bin/udp-proxy-2020 /usr/local/bin/
 
-# Cross-compile for FreeBSD x86_64
+# Build for FreeBSD
+# If already on FreeBSD, build natively. Otherwise error (cross-compile needs sysroot).
 freebsd:
-	zig build -Doptimize=ReleaseFast -Dtarget=x86_64-freebsd
+	set path = ( /root/project/zig-x86_64-freebsd-0.15.2 $path )
+	zig build -Doptimize=ReleaseSmall
 
 # Show help
 help:
@@ -39,5 +44,5 @@ help:
 	@echo "  make test     - Run tests"
 	@echo "  make clean    - Remove build artifacts"
 	@echo "  make install  - Install to /usr/local/bin"
-	@echo "  make freebsd  - Cross-compile for FreeBSD x86_64"
+	@echo "  make freebsd  - Build for FreeBSD (native only)"
 	@echo "  make help     - Show this help"
