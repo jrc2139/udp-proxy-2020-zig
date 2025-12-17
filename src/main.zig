@@ -255,8 +255,8 @@ pub fn main() !void {
     };
     defer pcap.freeDevices(allocator, interfaces);
 
-    // Create packet feed
-    var feed = sender.SendPktFeed.init(allocator);
+    // Create packet feed (with shared ring buffer for zero-copy broadcast)
+    var feed = try sender.SendPktFeed.init(allocator);
     defer feed.deinit();
 
     // Create listeners
