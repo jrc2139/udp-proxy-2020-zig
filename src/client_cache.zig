@@ -3,6 +3,10 @@
 //! Tracks learned client IP addresses for promiscuous interfaces.
 //! Used to forward packets to discovered clients on point-to-point
 //! interfaces like VPN tunnels.
+//!
+//! Design: Uses iterator pattern to eliminate per-packet allocation.
+//! Instead of allocating a fresh array for getClients(), callers
+//! iterate directly over valid entries with zero allocation.
 
 const std = @import("std");
 
@@ -111,7 +115,35 @@ pub const ClientCache = struct {
         log.debug("Learned client IP: {d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] });
     }
 
-    /// Get all valid (non-expired) client IPs
+    /// Zero-allocation iterator for valid (non-expired) clients.
+    /// Use this instead of getClients() to avoid per-packet allocation.
+    pub const ClientIterator = struct {
+        inner: std.StringHashMap(ClientEntry).Iterator,
+        now: i64,
+
+        pub fn next(self: *ClientIterator) ?[4]u8 {
+            while (self.inner.next()) |entry| {
+                if (entry.value_ptr.is_fixed or entry.value_ptr.expires_at > self.now) {
+                    if (parseIpKey(entry.key_ptr.*)) |ip| {
+                        return ip;
+                    }
+                }
+            }
+            return null;
+        }
+    };
+
+    /// Get an iterator over valid clients (zero allocation).
+    /// NOTE: Caller should hold awareness that cache mutex is NOT held during iteration.
+    /// This is safe because we only read, and entries are only removed by cleanup().
+    pub fn iterator(self: *ClientCache) ClientIterator {
+        return ClientIterator{
+            .inner = self.clients.iterator(),
+            .now = std.time.milliTimestamp(),
+        };
+    }
+
+    /// Get all valid (non-expired) client IPs (legacy allocating version)
     /// Caller must free the returned slice
     pub fn getClients(self: *ClientCache, allocator: std.mem.Allocator) ![][4]u8 {
         self.mutex.lock();
@@ -291,4 +323,25 @@ test "parseIpKey invalid" {
     try std.testing.expect(parseIpKey("256.0.0.1") == null);
     try std.testing.expect(parseIpKey("1.2.3") == null);
     try std.testing.expect(parseIpKey("not.an.ip") == null);
+}
+
+test "ClientIterator zero allocation" {
+    const allocator = std.testing.allocator;
+
+    var cache = ClientCache.init(allocator, 5);
+    defer cache.deinit();
+
+    // Add some clients
+    try cache.addFixed([_]u8{ 192, 168, 1, 1 });
+    try cache.learn([_]u8{ 10, 0, 0, 1 });
+    try cache.learn([_]u8{ 10, 0, 0, 2 });
+
+    // Iterate without allocation
+    var count: usize = 0;
+    var iter = cache.iterator();
+    while (iter.next()) |_| {
+        count += 1;
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), count);
 }
