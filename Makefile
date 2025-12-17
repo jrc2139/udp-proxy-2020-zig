@@ -11,7 +11,7 @@ all: release
 
 # Release build (optimized)
 release:
-	zig build -Doptimize=ReleaseSmall
+	zig build -Doptimize=ReleaseFast
 
 # Debug build
 debug:
@@ -32,8 +32,8 @@ install: release
 # Build for FreeBSD
 # If already on FreeBSD, build natively. Otherwise error (cross-compile needs sysroot).
 freebsd:
-	set path = ( /root/project/zig-x86_64-freebsd-0.15.2 $path )
-	zig build -Doptimize=ReleaseSmall
+	# set path = ( /root/project/zig-x86_64-freebsd-0.15.2 $path )
+	zig build -Doptimize=ReleaseFast
 
 # Show help
 help:

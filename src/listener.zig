@@ -52,8 +52,12 @@ pub const Listener = struct {
     broadcast_ip: ?[4]u8,
     /// Client cache (for promisc interfaces)
     client_cache: ClientCache,
-    /// Send channel for receiving packets to forward
-    send_channel: ?*sender.SendChannel,
+    /// Ref channel for receiving packet refs to forward (zero-copy)
+    ref_channel: ?*sender.RefChannel,
+    /// Reference to the SendPktFeed for accessing packet data
+    feed: ?*sender.SendPktFeed,
+    /// Pre-allocated buffer pool for outgoing packets
+    outgoing_pool: sender.OutgoingPool,
     /// Pcap dumper for incoming packets
     in_dumper: ?pcap.Dumper,
     /// Pcap dumper for outgoing packets
@@ -71,7 +75,9 @@ pub const Listener = struct {
             .hw_addr = [_]u8{0} ** 6,
             .broadcast_ip = null,
             .client_cache = ClientCache.init(allocator, config.cache_ttl_minutes),
-            .send_channel = null,
+            .ref_channel = null,
+            .feed = null,
+            .outgoing_pool = sender.OutgoingPool.init(),
             .in_dumper = null,
             .out_dumper = null,
             .running = false,
@@ -211,42 +217,43 @@ pub const Listener = struct {
 
     /// Register with the send feed
     pub fn registerSender(self: *Listener, feed: *sender.SendPktFeed) !void {
-        self.send_channel = try feed.registerSender(self.config.iface_name);
+        self.ref_channel = try feed.registerSender(self.config.iface_name);
+        self.feed = feed;
     }
 
-    /// Main packet handling loop
+    /// Main packet handling loop (zero-copy version)
     pub fn run(self: *Listener, feed: *sender.SendPktFeed) void {
         self.running = true;
 
-        // Cleanup timer (every 5 seconds)
+        // Cleanup timer (every 30 seconds - less aggressive than before)
         var last_cleanup = std.time.milliTimestamp();
-        const cleanup_interval: i64 = 5000;
+        const cleanup_interval: i64 = 30000;
 
         log.debug("{s}: starting packet handler (send_only={})", .{ self.config.iface_name, self.config.send_only });
 
         while (self.running) {
             if (self.config.send_only) {
                 // Send-only mode: block on channel, no pcap capture
-                if (self.send_channel) |channel| {
+                if (self.ref_channel) |channel| {
                     // Use blocking receive to avoid CPU spin
-                    if (channel.receive()) |pkt| {
-                        self.sendPackets(pkt) catch |err| {
+                    if (channel.receive()) |ref| {
+                        self.sendPacketsFromRef(ref) catch |err| {
                             log.warn("{s}: failed to send packet: {}", .{ self.config.iface_name, err });
                         };
                     }
                     // Drain any additional queued packets
-                    while (channel.tryReceive()) |pkt| {
-                        self.sendPackets(pkt) catch |err| {
+                    while (channel.tryReceive()) |ref| {
+                        self.sendPacketsFromRef(ref) catch |err| {
                             log.warn("{s}: failed to send packet: {}", .{ self.config.iface_name, err });
                         };
                     }
                 }
             } else {
-                // Normal mode: capture packets and check send channel
+                // Normal mode: capture packets and check ref channel
                 // Check for packets to send from other interfaces (non-blocking)
-                if (self.send_channel) |channel| {
-                    while (channel.tryReceive()) |pkt| {
-                        self.sendPackets(pkt) catch |err| {
+                if (self.ref_channel) |channel| {
+                    while (channel.tryReceive()) |ref| {
+                        self.sendPacketsFromRef(ref) catch |err| {
                             log.warn("{s}: failed to send packet: {}", .{ self.config.iface_name, err });
                         };
                     }
@@ -266,7 +273,7 @@ pub const Listener = struct {
                 }
             }
 
-            // Periodic cleanup
+            // Periodic cleanup (less frequent, lazy expiration handles most cases)
             const now = std.time.milliTimestamp();
             if (now - last_cleanup > cleanup_interval) {
                 self.client_cache.cleanup();
@@ -314,13 +321,19 @@ pub const Listener = struct {
         );
     }
 
-    /// Send packets received from other interfaces
-    fn sendPackets(self: *Listener, pkt: sender.SendPacket) !void {
+    /// Send packets from a packet reference (zero-copy version)
+    fn sendPacketsFromRef(self: *Listener, ref: sender.PacketRef) !void {
+        // Get packet data from the shared ring buffer
+        const pkt_data = if (self.feed) |feed|
+            feed.getPacketData(ref.ring_idx)
+        else
+            return error.NoFeed;
+
         // Parse the incoming packet
-        const parsed = packet.parsePacket(pkt.getData(), pkt.link_type) catch |err| {
+        const parsed = packet.parsePacket(pkt_data, ref.link_type) catch |err| {
             log.warn("{s}: failed to parse packet from {s}: {}", .{
                 self.config.iface_name,
-                pkt.src_interface,
+                ref.src_interface,
                 err,
             });
             return;
@@ -330,20 +343,15 @@ pub const Listener = struct {
         if (!self.config.promisc) {
             // Non-promiscuous: send to broadcast address
             if (self.broadcast_ip) |bcast_ip| {
-                try self.sendToDestination(parsed, bcast_ip, pkt);
+                try self.sendToDestinationZeroCopy(parsed, bcast_ip, ref);
             }
         } else {
-            // Promiscuous: send to each known client
-            const clients = try self.client_cache.getClients(self.allocator);
-            defer self.allocator.free(clients);
+            // Promiscuous: iterate clients without allocation
+            var client_iter = self.client_cache.iterator();
+            var sent_count: usize = 0;
 
-            if (clients.len == 0) {
-                log.debug("{s}: no clients to forward to", .{self.config.iface_name});
-                return;
-            }
-
-            for (clients) |client_ip| {
-                self.sendToDestination(parsed, client_ip, pkt) catch |err| {
+            while (client_iter.next()) |client_ip| {
+                self.sendToDestinationZeroCopy(parsed, client_ip, ref) catch |err| {
                     log.warn("{s}: failed to send to {d}.{d}.{d}.{d}: {}", .{
                         self.config.iface_name,
                         client_ip[0],
@@ -352,33 +360,41 @@ pub const Listener = struct {
                         client_ip[3],
                         err,
                     });
+                    continue;
                 };
+                sent_count += 1;
+            }
+
+            if (sent_count == 0) {
+                log.debug("{s}: no clients to forward to", .{self.config.iface_name});
             }
         }
     }
 
-    /// Send a packet to a specific destination
-    fn sendToDestination(
+    /// Send a packet to a specific destination using pre-allocated buffer (zero-copy)
+    fn sendToDestinationZeroCopy(
         self: *Listener,
         parsed: packet.ParsedPacket,
         dst_ip: [4]u8,
-        pkt: sender.SendPacket,
+        ref: sender.PacketRef,
     ) !void {
-        // Build the outgoing packet
-        const out_data = try sender.buildOutgoingPacket(
-            self.allocator,
+        // Acquire buffer from pre-allocated pool (no allocation!)
+        const buffer = self.outgoing_pool.acquire();
+
+        // Build the outgoing packet into pre-allocated buffer
+        const out_data = try sender.buildOutgoingPacketInto(
+            buffer,
             parsed,
             dst_ip,
             self.link_type,
             self.hw_addr,
         );
-        defer self.allocator.free(out_data);
 
         // Write to debug pcap
         if (self.out_dumper) |*d| {
             const info = pcap.CaptureInfo{
-                .timestamp_sec = pkt.timestamp_sec,
-                .timestamp_usec = pkt.timestamp_usec,
+                .timestamp_sec = ref.timestamp_sec,
+                .timestamp_usec = ref.timestamp_usec,
                 .capture_len = @intCast(out_data.len),
                 .wire_len = @intCast(out_data.len),
             };
@@ -403,7 +419,7 @@ pub const Listener = struct {
     /// Stop the listener
     pub fn stop(self: *Listener) void {
         self.running = false;
-        if (self.send_channel) |channel| {
+        if (self.ref_channel) |channel| {
             channel.close();
         }
     }
