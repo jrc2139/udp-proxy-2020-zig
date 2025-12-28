@@ -190,7 +190,9 @@ src/
 - Pre-allocated outgoing buffer pools (32 × 9KB)
 - Lock-free channels for inter-thread communication
 - Lazy TTL expiration (cleanup every 30s, not per-packet)
-- Client cache iterator avoids allocation in hot path
+- Client cache uses `[4]u8` keys directly (no string allocation/parsing)
+- RwLock for broadcast allows concurrent packet forwarding from multiple interfaces
+- Optimized IP checksum reads u16 directly instead of byte-by-byte construction
 
 ## License
 
