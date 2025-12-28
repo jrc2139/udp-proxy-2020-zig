@@ -305,6 +305,8 @@ pub const SendChannel = struct {
 };
 
 /// Packet feed that manages all send channels (zero-copy version)
+/// Uses RwLock: multiple broadcasts can happen concurrently (read),
+/// while registration is exclusive (write).
 pub const SendPktFeed = struct {
     /// Map of interface name to ref channel
     senders: std.StringHashMap(*RefChannel),
@@ -312,8 +314,8 @@ pub const SendPktFeed = struct {
     ring: *PacketRing,
     /// Allocator
     allocator: std.mem.Allocator,
-    /// Mutex for sender registration (not held during broadcast)
-    mutex: std.Thread.Mutex,
+    /// RwLock for concurrent broadcast (read) vs exclusive registration (write)
+    rwlock: std.Thread.RwLock,
 
     pub fn init(allocator: std.mem.Allocator) !SendPktFeed {
         const ring = try allocator.create(PacketRing);
@@ -323,13 +325,13 @@ pub const SendPktFeed = struct {
             .senders = std.StringHashMap(*RefChannel).init(allocator),
             .ring = ring,
             .allocator = allocator,
-            .mutex = .{},
+            .rwlock = .{},
         };
     }
 
     pub fn deinit(self: *SendPktFeed) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.rwlock.lock();
+        defer self.rwlock.unlock();
 
         var key_iter = self.senders.keyIterator();
         while (key_iter.next()) |key| {
@@ -346,10 +348,10 @@ pub const SendPktFeed = struct {
         self.allocator.destroy(self.ring);
     }
 
-    /// Register a ref channel for an interface
+    /// Register a ref channel for an interface (exclusive write lock)
     pub fn registerSender(self: *SendPktFeed, iface_name: []const u8) !*RefChannel {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.rwlock.lock();
+        defer self.rwlock.unlock();
 
         // Create new channel
         const channel = try self.allocator.create(RefChannel);
@@ -372,6 +374,7 @@ pub const SendPktFeed = struct {
 
     /// Broadcast a packet to all interfaces except the source (zero-copy)
     /// Stores packet data once in ring buffer, sends lightweight refs to all channels.
+    /// Uses shared read lock - multiple broadcasts can happen concurrently.
     pub fn broadcast(
         self: *SendPktFeed,
         data: []const u8,
@@ -397,9 +400,9 @@ pub const SendPktFeed = struct {
             .timestamp_usec = timestamp_usec,
         };
 
-        // Brief lock to iterate senders
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        // Shared read lock - allows concurrent broadcasts from multiple interfaces
+        self.rwlock.lockShared();
+        defer self.rwlock.unlockShared();
 
         var iter = self.senders.iterator();
         while (iter.next()) |entry| {
@@ -416,8 +419,8 @@ pub const SendPktFeed = struct {
 
     /// Get the number of registered senders
     pub fn count(self: *SendPktFeed) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.rwlock.lockShared();
+        defer self.rwlock.unlockShared();
         return self.senders.count();
     }
 };

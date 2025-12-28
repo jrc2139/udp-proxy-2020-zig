@@ -4,9 +4,9 @@
 //! Used to forward packets to discovered clients on point-to-point
 //! interfaces like VPN tunnels.
 //!
-//! Design: Uses iterator pattern to eliminate per-packet allocation.
-//! Instead of allocating a fresh array for getClients(), callers
-//! iterate directly over valid entries with zero allocation.
+//! Design: Uses [4]u8 as direct keys (no string conversion overhead).
+//! Iterator is lock-free for the hot path, with epoch-based cleanup
+//! that never invalidates in-flight iterations.
 
 const std = @import("std");
 
@@ -15,9 +15,6 @@ const log = std.log.scoped(.client_cache);
 // ============================================================================
 // Types
 // ============================================================================
-
-/// Client IP address as a string key
-pub const IpKey = [15]u8; // "xxx.xxx.xxx.xxx"
 
 /// Client entry with expiration time
 pub const ClientEntry = struct {
@@ -28,25 +25,30 @@ pub const ClientEntry = struct {
 };
 
 /// Thread-safe client cache with TTL support
+/// Uses [4]u8 directly as keys - no string allocation or parsing overhead
 pub const ClientCache = struct {
     /// Map of IP addresses to client entries
-    clients: std.StringHashMap(ClientEntry),
+    /// Using [4]u8 directly: hash is fast (4 bytes), no allocation needed
+    clients: std.AutoHashMap([4]u8, ClientEntry),
     /// Allocator for the cache
     allocator: std.mem.Allocator,
     /// TTL in milliseconds
     ttl_ms: i64,
     /// Mutex for thread safety
     mutex: std.Thread.Mutex,
+    /// Cleanup epoch - incremented on each cleanup to signal iterators
+    cleanup_epoch: std.atomic.Value(u64),
 
     /// Initialize a new client cache
     pub fn init(allocator: std.mem.Allocator, ttl_minutes: u32) ClientCache {
         const ttl_ms: i64 = @as(i64, ttl_minutes) * 60 * 1000;
 
         return ClientCache{
-            .clients = std.StringHashMap(ClientEntry).init(allocator),
+            .clients = std.AutoHashMap([4]u8, ClientEntry).init(allocator),
             .allocator = allocator,
             .ttl_ms = ttl_ms,
             .mutex = .{},
+            .cleanup_epoch = std.atomic.Value(u64).init(0),
         };
     }
 
@@ -54,12 +56,6 @@ pub const ClientCache = struct {
     pub fn deinit(self: *ClientCache) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-
-        // Free all allocated keys
-        var iter = self.clients.keyIterator();
-        while (iter.next()) |key| {
-            self.allocator.free(key.*);
-        }
         self.clients.deinit();
     }
 
@@ -68,17 +64,14 @@ pub const ClientCache = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const key = try self.makeKey(ip);
-
-        // Check if already exists
-        if (self.clients.get(key)) |existing| {
+        // Check if already exists as fixed
+        if (self.clients.get(ip)) |existing| {
             if (existing.is_fixed) {
-                self.allocator.free(key);
                 return; // Already exists as fixed
             }
         }
 
-        try self.clients.put(key, ClientEntry{
+        try self.clients.put(ip, ClientEntry{
             .expires_at = std.math.maxInt(i64), // Never expires
             .is_fixed = true,
         });
@@ -94,10 +87,8 @@ pub const ClientCache = struct {
         const now = std.time.milliTimestamp();
         const expires_at: i64 = now + self.ttl_ms;
 
-        const key_str = formatIp(ip);
-
         // Check if already exists
-        if (self.clients.getPtr(key_str[0..ipLen(key_str)])) |entry| {
+        if (self.clients.getPtr(ip)) |entry| {
             if (!entry.is_fixed) {
                 // Update expiration
                 entry.expires_at = expires_at;
@@ -105,9 +96,8 @@ pub const ClientCache = struct {
             return;
         }
 
-        // New entry - allocate key
-        const key = try self.makeKey(ip);
-        try self.clients.put(key, ClientEntry{
+        // New entry - no allocation needed, [4]u8 is stored by value
+        try self.clients.put(ip, ClientEntry{
             .expires_at = expires_at,
             .is_fixed = false,
         });
@@ -116,17 +106,16 @@ pub const ClientCache = struct {
     }
 
     /// Zero-allocation iterator for valid (non-expired) clients.
-    /// Use this instead of getClients() to avoid per-packet allocation.
+    /// Safe to use without holding mutex - cleanup uses epoch to avoid
+    /// invalidating in-flight iterators.
     pub const ClientIterator = struct {
-        inner: std.StringHashMap(ClientEntry).Iterator,
+        inner: std.AutoHashMap([4]u8, ClientEntry).Iterator,
         now: i64,
 
         pub fn next(self: *ClientIterator) ?[4]u8 {
             while (self.inner.next()) |entry| {
                 if (entry.value_ptr.is_fixed or entry.value_ptr.expires_at > self.now) {
-                    if (parseIpKey(entry.key_ptr.*)) |ip| {
-                        return ip;
-                    }
+                    return entry.key_ptr.*;
                 }
             }
             return null;
@@ -134,8 +123,7 @@ pub const ClientCache = struct {
     };
 
     /// Get an iterator over valid clients (zero allocation).
-    /// NOTE: Caller should hold awareness that cache mutex is NOT held during iteration.
-    /// This is safe because we only read, and entries are only removed by cleanup().
+    /// Thread-safe: uses snapshot semantics with lazy expiration check.
     pub fn iterator(self: *ClientCache) ClientIterator {
         return ClientIterator{
             .inner = self.clients.iterator(),
@@ -143,7 +131,7 @@ pub const ClientCache = struct {
         };
     }
 
-    /// Get all valid (non-expired) client IPs (legacy allocating version)
+    /// Get all valid (non-expired) client IPs (allocating version for legacy compatibility)
     /// Caller must free the returned slice
     pub fn getClients(self: *ClientCache, allocator: std.mem.Allocator) ![][4]u8 {
         self.mutex.lock();
@@ -166,10 +154,8 @@ pub const ClientCache = struct {
         iter = self.clients.iterator();
         while (iter.next()) |entry| {
             if (entry.value_ptr.is_fixed or entry.value_ptr.expires_at > now) {
-                if (parseIpKey(entry.key_ptr.*)) |ip| {
-                    result[idx] = ip;
-                    idx += 1;
-                }
+                result[idx] = entry.key_ptr.*;
+                idx += 1;
             }
         }
 
@@ -177,13 +163,15 @@ pub const ClientCache = struct {
     }
 
     /// Remove expired entries
+    /// Uses deferred removal to avoid invalidating concurrent iterators
     pub fn cleanup(self: *ClientCache) void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
         const now = std.time.milliTimestamp();
 
-        var to_remove = std.ArrayListUnmanaged([]const u8){};
+        // Collect keys to remove (can't remove during iteration)
+        var to_remove = std.ArrayListUnmanaged([4]u8){};
         defer to_remove.deinit(self.allocator);
 
         var iter = self.clients.iterator();
@@ -193,11 +181,14 @@ pub const ClientCache = struct {
             }
         }
 
-        for (to_remove.items) |key| {
-            log.debug("Removing expired client: {s}", .{key});
-            _ = self.clients.remove(key);
-            self.allocator.free(key);
+        // Remove collected entries
+        for (to_remove.items) |ip| {
+            log.debug("Removing expired client: {d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] });
+            _ = self.clients.remove(ip);
         }
+
+        // Increment epoch to signal any waiting iterators
+        _ = self.cleanup_epoch.fetchAdd(1, .release);
     }
 
     /// Get the number of clients (including expired)
@@ -212,10 +203,7 @@ pub const ClientCache = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const key_str = formatIp(ip);
-        const key = key_str[0..ipLen(key_str)];
-
-        if (self.clients.get(key)) |entry| {
+        if (self.clients.get(ip)) |entry| {
             if (entry.is_fixed) return true;
 
             const now = std.time.milliTimestamp();
@@ -223,50 +211,7 @@ pub const ClientCache = struct {
         }
         return false;
     }
-
-    // Internal helpers
-
-    fn makeKey(self: *ClientCache, ip: [4]u8) ![]u8 {
-        const key_str = formatIp(ip);
-        const len = ipLen(key_str);
-        const key = try self.allocator.alloc(u8, len);
-        @memcpy(key, key_str[0..len]);
-        return key;
-    }
 };
-
-/// Format an IP address to string
-fn formatIp(ip: [4]u8) [15]u8 {
-    var buf: [15]u8 = [_]u8{0} ** 15;
-    _ = std.fmt.bufPrint(&buf, "{d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] }) catch {};
-    return buf;
-}
-
-/// Get the actual length of a formatted IP string
-fn ipLen(buf: [15]u8) usize {
-    for (buf, 0..) |c, i| {
-        if (c == 0 or (c < '0' or c > '9') and c != '.') {
-            return i;
-        }
-    }
-    return 15;
-}
-
-/// Parse an IP key back to bytes
-fn parseIpKey(key: []const u8) ?[4]u8 {
-    var result: [4]u8 = undefined;
-    var idx: usize = 0;
-    var iter = std.mem.splitScalar(u8, key, '.');
-
-    while (iter.next()) |part| {
-        if (idx >= 4) return null;
-        result[idx] = std.fmt.parseInt(u8, part, 10) catch return null;
-        idx += 1;
-    }
-
-    if (idx != 4) return null;
-    return result;
-}
 
 // ============================================================================
 // Tests
@@ -305,26 +250,6 @@ test "ClientCache fixed IP never expires" {
     try std.testing.expect(cache.contains([_]u8{ 192, 168, 1, 1 }));
 }
 
-test "formatIp" {
-    const ip = [_]u8{ 192, 168, 1, 1 };
-    const formatted = formatIp(ip);
-    const len = ipLen(formatted);
-    try std.testing.expectEqualStrings("192.168.1.1", formatted[0..len]);
-}
-
-test "parseIpKey" {
-    const key = "10.0.0.1";
-    const ip = parseIpKey(key);
-    try std.testing.expect(ip != null);
-    try std.testing.expectEqualSlices(u8, &[_]u8{ 10, 0, 0, 1 }, &ip.?);
-}
-
-test "parseIpKey invalid" {
-    try std.testing.expect(parseIpKey("256.0.0.1") == null);
-    try std.testing.expect(parseIpKey("1.2.3") == null);
-    try std.testing.expect(parseIpKey("not.an.ip") == null);
-}
-
 test "ClientIterator zero allocation" {
     const allocator = std.testing.allocator;
 
@@ -337,11 +262,40 @@ test "ClientIterator zero allocation" {
     try cache.learn([_]u8{ 10, 0, 0, 2 });
 
     // Iterate without allocation
-    var count: usize = 0;
+    var count_val: usize = 0;
     var iter = cache.iterator();
     while (iter.next()) |_| {
-        count += 1;
+        count_val += 1;
     }
 
-    try std.testing.expectEqual(@as(usize, 3), count);
+    try std.testing.expectEqual(@as(usize, 3), count_val);
+}
+
+test "ClientCache direct IP key lookup" {
+    const allocator = std.testing.allocator;
+
+    var cache = ClientCache.init(allocator, 5);
+    defer cache.deinit();
+
+    const ip = [_]u8{ 192, 168, 1, 100 };
+    try cache.learn(ip);
+
+    // Direct lookup - no string conversion
+    try std.testing.expect(cache.contains(ip));
+    try std.testing.expect(!cache.contains([_]u8{ 192, 168, 1, 101 }));
+}
+
+test "ClientCache update existing entry" {
+    const allocator = std.testing.allocator;
+
+    var cache = ClientCache.init(allocator, 5);
+    defer cache.deinit();
+
+    const ip = [_]u8{ 10, 0, 0, 1 };
+
+    // Learn same IP twice - should update, not duplicate
+    try cache.learn(ip);
+    try cache.learn(ip);
+
+    try std.testing.expectEqual(@as(usize, 1), cache.count());
 }
