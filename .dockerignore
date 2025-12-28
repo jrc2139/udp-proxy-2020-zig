@@ -1,0 +1,26 @@
+# Build artifacts
+zig-out/
+.zig-cache/
+
+# Git
+.git/
+.gitignore
+
+# IDE/Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Documentation
+*.md
+!README.md
+LICENSE
+
+# Test results
+test-results/
+
+# Local development
+.env
+.env.local

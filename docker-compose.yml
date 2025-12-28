@@ -1,0 +1,145 @@
+# udp-proxy-2020 Integration Test Environment
+#
+# Topology:
+#   net_alpha (172.20.0.0/24)              net_beta (172.21.0.0/24)
+#   ┌─────────────────┐                    ┌─────────────────┐
+#   │     sender      │                    │    receiver     │
+#   │   172.20.0.10   │                    │   172.21.0.10   │
+#   └────────┬────────┘                    └────────┬────────┘
+#            │                                      │
+#            └──────────┬──────────────────┬────────┘
+#                       │    udp-proxy     │
+#                       │ eth0: 172.20.0.2 │
+#                       │ eth1: 172.21.0.2 │
+#                       └──────────────────┘
+#
+# Usage:
+#   docker compose up -d proxy
+#   docker compose run --rm sender
+#   docker compose run --rm receiver
+
+services:
+  # ===========================================================================
+  # UDP Proxy - The system under test
+  # ===========================================================================
+  proxy:
+    build:
+      context: .
+      target: runtime
+    container_name: udp-proxy
+    hostname: udp-proxy
+    networks:
+      net_alpha:
+        ipv4_address: 172.20.0.2
+      net_beta:
+        ipv4_address: 172.21.0.2
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    # Command will be overridden by test scripts
+    command: >
+      udp-proxy-2020
+      -i eth0 -i eth1
+      -p 9003 -p 1900 -p 5353
+      -L debug
+    healthcheck:
+      test: ["CMD", "pgrep", "udp-proxy-2020"]
+      interval: 2s
+      timeout: 2s
+      retries: 5
+      start_period: 3s
+
+  # ===========================================================================
+  # Sender - Broadcasts UDP packets on net_alpha
+  # ===========================================================================
+  sender:
+    build:
+      context: .
+      target: test-runner
+    container_name: udp-sender
+    hostname: sender
+    networks:
+      net_alpha:
+        ipv4_address: 172.20.0.10
+    cap_add:
+      - NET_RAW
+    depends_on:
+      proxy:
+        condition: service_healthy
+    # Interactive by default; override with test commands
+    stdin_open: true
+    tty: true
+    command: ["bash"]
+
+  # ===========================================================================
+  # Receiver - Listens for UDP packets on net_beta
+  # ===========================================================================
+  receiver:
+    build:
+      context: .
+      target: test-runner
+    container_name: udp-receiver
+    hostname: receiver
+    networks:
+      net_beta:
+        ipv4_address: 172.21.0.10
+    depends_on:
+      proxy:
+        condition: service_healthy
+    stdin_open: true
+    tty: true
+    command: ["bash"]
+
+  # ===========================================================================
+  # Test Runner - Orchestrates integration tests
+  # ===========================================================================
+  test-runner:
+    build:
+      context: .
+      target: test-runner
+    container_name: udp-test-runner
+    hostname: test-runner
+    networks:
+      net_alpha:
+        ipv4_address: 172.20.0.100
+      net_beta:
+        ipv4_address: 172.21.0.100
+    cap_add:
+      - NET_RAW
+    depends_on:
+      proxy:
+        condition: service_healthy
+    volumes:
+      - ./tests/integration:/tests:ro
+      - test-results:/results
+    environment:
+      - PROXY_ALPHA_IP=172.20.0.2
+      - PROXY_BETA_IP=172.21.0.2
+      - SENDER_IP=172.20.0.10
+      - RECEIVER_IP=172.21.0.10
+      - TEST_PORT=9003
+    command: ["bash", "/tests/run-tests.sh"]
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  net_alpha:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+          gateway: 172.20.0.1
+
+  net_beta:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.21.0.0/24
+          gateway: 172.21.0.1
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  test-results:

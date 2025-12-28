@@ -142,7 +142,22 @@ src/
 - Each module contains its own unit tests
 - `tests.zig` aggregates all module tests via `std.testing.refAllDecls`
 - Integration tests verify cross-module behavior
-- Run with `zig build test`
+- Run unit tests with `zig build test` or `make test`
+- Run integration tests with `make integration-test` (requires Docker)
+
+### Integration Tests (Docker)
+The project includes Docker-based integration tests that verify packet forwarding:
+```bash
+# Run all integration tests
+make integration-test
+
+# Or manually:
+docker compose build
+docker compose up -d proxy
+docker compose run --rm test-runner
+docker compose down -v
+```
+See `tests/integration/README.md` for details.
 
 ## Common Development Tasks
 
