@@ -1,0 +1,8 @@
+udp-proxy-2020-zig - UDP proxy for Zig
+Copyright (C) 2025 jrc2139
+
+This project is a Zig implementation inspired by:
+
+udp-proxy-2020 (https://github.com/synfinatic/udp-proxy-2020)
+Copyright (c) synfinatic
+Licensed under MIT License
