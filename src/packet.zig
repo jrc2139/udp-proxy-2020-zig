@@ -463,26 +463,25 @@ pub const PacketBuilder = struct {
 // ============================================================================
 
 /// Calculate IPv4 header checksum
+/// Optimized to read u16 directly instead of byte-by-byte construction
 pub fn calculateIpChecksum(header: *IPv4Header) void {
     // Zero out checksum field
     header.checksum = 0;
 
-    const header_bytes: [*]const u8 = @ptrCast(header);
-    const header_len = header.getHeaderLength();
+    // Cast to u16 array for direct word access (header is aligned)
+    const header_u16: [*]const u16 = @ptrCast(@alignCast(header));
+    const header_len_u16 = header.getHeaderLength() / 2;
 
     var sum: u32 = 0;
-    var i: usize = 0;
 
-    // Sum all 16-bit words
-    while (i < header_len) : (i += 2) {
-        const word: u16 = (@as(u16, header_bytes[i]) << 8) | header_bytes[i + 1];
-        sum += word;
+    // Sum all 16-bit words directly (no byte manipulation)
+    for (0..header_len_u16) |i| {
+        sum += std.mem.bigToNative(u16, header_u16[i]);
     }
 
-    // Fold 32-bit sum to 16 bits
-    while ((sum >> 16) != 0) {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
+    // Fold 32-bit sum to 16 bits (at most 2 iterations needed)
+    sum = (sum & 0xFFFF) + (sum >> 16);
+    sum = (sum & 0xFFFF) + (sum >> 16);
 
     // One's complement
     header.checksum = std.mem.nativeToBig(u16, @as(u16, @truncate(~sum)));
