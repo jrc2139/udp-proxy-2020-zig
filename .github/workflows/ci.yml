@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+env:
+  ZIG_VERSION: "0.15.0"
+
+jobs:
+  # ===========================================================================
+  # Unit Tests
+  # ===========================================================================
+  unit-tests:
+    name: Unit Tests
+    runs-on: [self-hosted, Linux]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpcap-dev
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Run unit tests
+        run: zig build test
+
+      - name: Build release
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Verify binary
+        run: ./zig-out/bin/udp-proxy-2020 --version
+
+  # ===========================================================================
+  # Integration Tests
+  # ===========================================================================
+  integration-tests:
+    name: Integration Tests
+    runs-on: [self-hosted, Linux]
+    needs: unit-tests
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify Docker
+        run: |
+          docker --version
+          docker compose version
+
+      - name: Build Docker images
+        run: docker compose build
+
+      - name: Start proxy service
+        run: docker compose up -d proxy
+
+      - name: Wait for proxy to be healthy
+        run: |
+          echo "Waiting for proxy to be healthy..."
+          timeout 30 bash -c 'until docker compose ps proxy | grep -q healthy; do sleep 1; done'
+          docker compose ps
+
+      - name: Run integration tests
+        run: docker compose run --rm test-runner
+
+      - name: Collect proxy logs (on failure)
+        if: failure()
+        run: docker compose logs proxy
+
+      - name: Cleanup
+        if: always()
+        run: docker compose down -v --remove-orphans
