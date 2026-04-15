@@ -9,7 +9,7 @@
 //! that never invalidates in-flight iterations.
 
 const std = @import("std");
-const c_time = @cImport({
+const c = @cImport({
     @cInclude("sys/time.h");
 });
 
@@ -18,8 +18,8 @@ const log = std.log.scoped(.client_cache);
 /// Return milliseconds since Unix epoch using POSIX gettimeofday.
 /// Replaces milliTimestamp() which was removed in Zig 0.16.
 fn milliTimestamp() i64 {
-    var tv: c_time.struct_timeval = undefined;
-    _ = c_time.gettimeofday(&tv, null);
+    var tv: c.struct_timeval = undefined;
+    _ = c.gettimeofday(&tv, null);
     return @as(i64, tv.tv_sec) * 1000 + @divTrunc(tv.tv_usec, 1000);
 }
 
@@ -142,63 +142,32 @@ pub const ClientCache = struct {
         };
     }
 
-    /// Get all valid (non-expired) client IPs (allocating version for legacy compatibility)
-    /// Caller must free the returned slice
-    pub fn getClients(self: *ClientCache, allocator: std.mem.Allocator) ![][4]u8 {
-        self.mutex.lockUncancelable(undefined);
-        defer self.mutex.unlock(undefined);
-
-        const now = milliTimestamp();
-
-        // Count valid clients first
-        var valid_count: usize = 0;
-        var iter = self.clients.iterator();
-        while (iter.next()) |entry| {
-            if (entry.value_ptr.is_fixed or entry.value_ptr.expires_at > now) {
-                valid_count += 1;
-            }
-        }
-
-        var result = try allocator.alloc([4]u8, valid_count);
-        var idx: usize = 0;
-
-        iter = self.clients.iterator();
-        while (iter.next()) |entry| {
-            if (entry.value_ptr.is_fixed or entry.value_ptr.expires_at > now) {
-                result[idx] = entry.key_ptr.*;
-                idx += 1;
-            }
-        }
-
-        return result[0..idx];
-    }
-
-    /// Remove expired entries
-    /// Uses deferred removal to avoid invalidating concurrent iterators
+    /// Remove expired entries using stack-allocated collection (no heap allocation).
     pub fn cleanup(self: *ClientCache) void {
         self.mutex.lockUncancelable(undefined);
         defer self.mutex.unlock(undefined);
 
         const now = milliTimestamp();
 
-        // Collect keys to remove (can't remove during iteration)
-        var to_remove = std.ArrayListUnmanaged([4]u8).empty;
-        defer to_remove.deinit(self.allocator);
+        // Stack-allocated buffer for expired keys (64 clients is plenty for VPN peers)
+        var to_remove: [64][4]u8 = undefined;
+        var remove_count: usize = 0;
 
         var iter = self.clients.iterator();
         while (iter.next()) |entry| {
             if (!entry.value_ptr.is_fixed and entry.value_ptr.expires_at <= now) {
-                to_remove.append(self.allocator, entry.key_ptr.*) catch continue;
+                if (remove_count < to_remove.len) {
+                    to_remove[remove_count] = entry.key_ptr.*;
+                    remove_count += 1;
+                }
             }
         }
 
-        // Remove collected entries
-        for (to_remove.items) |ip| {
+        for (to_remove[0..remove_count]) |ip| {
             log.debug("Removing expired client: {d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] });
             _ = self.clients.remove(ip);
         }
 
-        // Increment epoch to signal any waiting iterators
         _ = self.cleanup_epoch.fetchAdd(1, .release);
     }
 
@@ -242,10 +211,11 @@ test "ClientCache basic operations" {
     try cache.learn([_]u8{ 10, 0, 0, 1 });
     try std.testing.expect(cache.contains([_]u8{ 10, 0, 0, 1 }));
 
-    // Get all clients
-    const clients = try cache.getClients(allocator);
-    defer allocator.free(clients);
-    try std.testing.expectEqual(@as(usize, 2), clients.len);
+    // Iterate clients
+    var count_val: usize = 0;
+    var iter = cache.iterator();
+    while (iter.next()) |_| count_val += 1;
+    try std.testing.expectEqual(@as(usize, 2), count_val);
 }
 
 test "ClientCache fixed IP never expires" {

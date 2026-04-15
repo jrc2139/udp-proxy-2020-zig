@@ -113,11 +113,11 @@ test "client cache TTL behavior" {
     // All should be present
     try std.testing.expectEqual(@as(usize, 3), cache.count());
 
-    // Get clients
-    const clients = try cache.getClients(allocator);
-    defer allocator.free(clients);
-
-    try std.testing.expectEqual(@as(usize, 3), clients.len);
+    // Iterate clients
+    var count_val: usize = 0;
+    var iter = cache.iterator();
+    while (iter.next()) |_| count_val += 1;
+    try std.testing.expectEqual(@as(usize, 3), count_val);
 }
 
 test "network calculations" {

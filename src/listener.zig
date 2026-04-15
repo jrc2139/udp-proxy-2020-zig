@@ -9,11 +9,12 @@ const packet = @import("packet.zig");
 const bpf = @import("bpf.zig");
 const sender = @import("sender.zig");
 const ClientCache = @import("client_cache.zig").ClientCache;
-const c_time = @cImport({
+const c = @cImport({
     @cInclude("sys/time.h");
     @cInclude("sys/socket.h");
     @cInclude("netinet/in.h");
     @cInclude("unistd.h");
+    @cInclude("poll.h");
 });
 
 const log = std.log.scoped(.listener);
@@ -21,8 +22,8 @@ const log = std.log.scoped(.listener);
 /// Return milliseconds since Unix epoch using POSIX gettimeofday.
 /// Replaces milliTimestamp() which was removed in Zig 0.16.
 fn milliTimestamp() i64 {
-    var tv: c_time.struct_timeval = undefined;
-    _ = c_time.gettimeofday(&tv, null);
+    var tv: c.struct_timeval = undefined;
+    _ = c.gettimeofday(&tv, null);
     return @as(i64, tv.tv_sec) * 1000 + @divTrunc(tv.tv_usec, 1000);
 }
 
@@ -445,61 +446,79 @@ pub const Listener = struct {
     }
 };
 
-/// UDP sink - listens on UDP ports to prevent ICMP Port Unreachable
+/// UDP sink - binds UDP ports to absorb traffic and prevent ICMP Port Unreachable.
+/// Uses a single poll thread for all sockets instead of thread-per-socket.
 pub const UdpSink = struct {
     sockets: std.ArrayListUnmanaged(c_int),
     allocator: std.mem.Allocator,
-    threads: std.ArrayListUnmanaged(std.Thread),
+    thread: ?std.Thread,
 
     pub fn init(allocator: std.mem.Allocator) UdpSink {
         return UdpSink{
             .sockets = .empty,
             .allocator = allocator,
-            .threads = .empty,
+            .thread = null,
         };
     }
 
     pub fn deinit(self: *UdpSink) void {
+        // Close all sockets -- causes poll() to return in the sink thread
         for (self.sockets.items) |sock| {
-            _ = c_time.close(sock);
+            _ = c.close(sock);
         }
-        self.sockets.deinit(self.allocator);
-
-        for (self.threads.items) |thread| {
+        if (self.thread) |thread| {
             thread.join();
         }
-        self.threads.deinit(self.allocator);
+        self.sockets.deinit(self.allocator);
     }
 
     /// Bind to the specified port on the given interface address
     pub fn bind(self: *UdpSink, ip: [4]u8, port: u16) !void {
-        const sock = c_time.socket(c_time.AF_INET, c_time.SOCK_DGRAM, 0);
+        const sock = c.socket(c.AF_INET, c.SOCK_DGRAM, 0);
         if (sock < 0) return error.SocketCreationFailed;
-        errdefer _ = c_time.close(sock);
+        errdefer _ = c.close(sock);
 
-        var addr: c_time.struct_sockaddr_in = std.mem.zeroes(c_time.struct_sockaddr_in);
-        addr.sin_family = c_time.AF_INET;
+        // Allow quick restart without EADDRINUSE
+        const enable: c_int = 1;
+        _ = c.setsockopt(sock, c.SOL_SOCKET, c.SO_REUSEADDR, @ptrCast(&enable), @sizeOf(c_int));
+
+        var addr: c.struct_sockaddr_in = std.mem.zeroes(c.struct_sockaddr_in);
+        addr.sin_family = c.AF_INET;
         addr.sin_port = std.mem.nativeToBig(u16, port);
         addr.sin_addr.s_addr = @bitCast(ip);
 
-        if (c_time.bind(sock, @ptrCast(&addr), @sizeOf(c_time.struct_sockaddr_in)) < 0) {
+        if (c.bind(sock, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_in)) < 0) {
             log.warn("Failed to bind to {d}.{d}.{d}.{d}:{d}", .{ ip[0], ip[1], ip[2], ip[3], port });
             return error.BindFailed;
         }
 
         try self.sockets.append(self.allocator, sock);
-
-        const thread = try std.Thread.spawn(.{}, sinkThread, .{sock});
-        try self.threads.append(self.allocator, thread);
-
         log.debug("UDP sink bound to {d}.{d}.{d}.{d}:{d}", .{ ip[0], ip[1], ip[2], ip[3], port });
     }
 
-    fn sinkThread(sock: c_int) void {
+    /// Start the single poll thread after all sockets are bound
+    pub fn start(self: *UdpSink) !void {
+        if (self.sockets.items.len == 0) return;
+        self.thread = try std.Thread.spawn(.{}, sinkPollThread, .{self.sockets.items});
+    }
+
+    fn sinkPollThread(sockets: []const c_int) void {
+        var pfds: [64]c.struct_pollfd = undefined;
+        const n = @min(sockets.len, pfds.len);
+        for (sockets[0..n], 0..n) |sock, i| {
+            pfds[i] = .{ .fd = sock, .events = c.POLLIN, .revents = 0 };
+        }
+
         var buf: [8192]u8 = undefined;
         while (true) {
-            const n = c_time.recvfrom(sock, &buf, buf.len, 0, null, null);
-            if (n < 0) break;
+            const ret = c.poll(&pfds, @intCast(n), -1);
+            if (ret < 0) break; // sockets closed, exit
+            for (pfds[0..n]) |*pfd| {
+                if (pfd.revents & c.POLLIN != 0) {
+                    _ = c.recvfrom(pfd.fd, &buf, buf.len, 0, null, null);
+                }
+                if (pfd.revents & c.POLLNVAL != 0) return; // fd closed
+            }
         }
     }
 };

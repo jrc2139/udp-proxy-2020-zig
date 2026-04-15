@@ -7,7 +7,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const c_sys = @cImport({
+const c = @cImport({
     @cInclude("fcntl.h");
     @cInclude("unistd.h");
     @cInclude("time.h");
@@ -112,8 +112,8 @@ fn customLog(
     const scope_prefix = if (scope == .default) "" else "[" ++ @tagName(scope) ++ "] ";
 
     // Get current timestamp via POSIX gettimeofday (std.time.timestamp removed in 0.16)
-    var tv: c_sys.struct_timeval = undefined;
-    _ = c_sys.gettimeofday(&tv, null);
+    var tv: c.struct_timeval = undefined;
+    _ = c.gettimeofday(&tv, null);
     const epoch_secs: u64 = @intCast(tv.tv_sec);
     const epoch_day = std.time.epoch.EpochDay{ .day = @intCast(@divFloor(epoch_secs, std.time.s_per_day)) };
     const year_day = epoch_day.calculateYearDay();
@@ -142,7 +142,7 @@ fn customLog(
 
     // Write via POSIX fd to avoid requiring io (std.Io.File.write requires io)
     const fd: std.Io.File.Handle = if (log_file) |f| f.handle else std.Io.File.stderr().handle;
-    _ = c_sys.write(fd, msg.ptr, msg.len);
+    _ = c.write(fd, msg.ptr, msg.len);
 }
 
 fn initLogFile(path: ?[]const u8) !void {
@@ -150,9 +150,9 @@ fn initLogFile(path: ?[]const u8) !void {
     // Open with O_WRONLY using POSIX open (std.fs.cwd().openFile requires io in 0.16)
     var path_buf: [512]u8 = undefined;
     const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{log_path}) catch return error.PathTooLong;
-    const fd = c_sys.open(path_z.ptr, c_sys.O_WRONLY, @as(c_int, 0o644));
+    const fd = c.open(path_z.ptr, c.O_WRONLY, @as(c_int, 0o644));
     if (fd < 0) return error.FileNotFound;
-    _ = c_sys.lseek(fd, 0, c_sys.SEEK_END);
+    _ = c.lseek(fd, 0, c.SEEK_END);
     log_file = std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
 }
 
@@ -162,19 +162,19 @@ fn initLogFileCreate(path: ?[]const u8) !void {
     var path_buf: [512]u8 = undefined;
     const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{log_path}) catch return error.PathTooLong;
     // Try open first; create if missing
-    var fd = c_sys.open(path_z.ptr, c_sys.O_WRONLY, @as(c_int, 0o644));
+    var fd = c.open(path_z.ptr, c.O_WRONLY, @as(c_int, 0o644));
     if (fd < 0) {
-        fd = c_sys.open(path_z.ptr, c_sys.O_WRONLY | c_sys.O_CREAT | c_sys.O_TRUNC, @as(c_int, 0o644));
+        fd = c.open(path_z.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_int, 0o644));
         if (fd < 0) return error.OpenFailed;
     } else {
-        _ = c_sys.lseek(fd, 0, c_sys.SEEK_END);
+        _ = c.lseek(fd, 0, c.SEEK_END);
     }
     log_file = std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
 }
 
 fn deinitLogFile() void {
     if (log_file) |f| {
-        _ = c_sys.close(f.handle);
+        _ = c.close(f.handle);
         log_file = null;
     }
 }
@@ -216,7 +216,7 @@ pub fn main(proc_init: std.process.Init.Minimal) !void {
             // Fall back to stderr if we can't open log file
             var err_buf: [256]u8 = undefined;
             const msg = std.fmt.bufPrint(&err_buf, "Warning: Could not open log file: {}\n", .{err}) catch "Warning: Could not open log file\n";
-            _ = c_sys.write(std.Io.File.stderr().handle, msg.ptr, msg.len);
+            _ = c.write(std.Io.File.stderr().handle, msg.ptr, msg.len);
         };
     }
     defer deinitLogFile();
@@ -404,6 +404,9 @@ fn runWithThreads(
     }
     defer if (sink) |*s| s.deinit();
 
+    // Start the sink poll thread after all binds are done
+    if (sink) |*s| try s.start();
+
     log.info("Initialization complete! Starting packet handlers (thread mode)...", .{});
 
     // Start listener threads
@@ -559,7 +562,7 @@ fn printHelp() void {
         \\
         \\
     ;
-    _ = c_sys.write(std.Io.File.stdout().handle, help.ptr, help.len);
+    _ = c.write(std.Io.File.stdout().handle, help.ptr, help.len);
 }
 
 // ============================================================================
