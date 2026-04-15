@@ -1,15 +1,29 @@
 //! Per-interface packet listener
 //!
 //! Handles packet capture, learning, and forwarding for a single interface.
+//! Supports both thread-based (run) and coroutine-based (runCoro) operation.
 
 const std = @import("std");
+const aio = @import("aio");
+const coro = @import("coro");
 const pcap = @import("pcap.zig");
 const packet = @import("packet.zig");
 const bpf = @import("bpf.zig");
 const sender = @import("sender.zig");
 const ClientCache = @import("client_cache.zig").ClientCache;
+const c_time = @cImport({
+    @cInclude("sys/time.h");
+});
 
 const log = std.log.scoped(.listener);
+
+/// Return milliseconds since Unix epoch using POSIX gettimeofday.
+/// Replaces milliTimestamp() which was removed in Zig 0.16.
+fn milliTimestamp() i64 {
+    var tv: c_time.struct_timeval = undefined;
+    _ = c_time.gettimeofday(&tv, null);
+    return @as(i64, tv.tv_sec) * 1000 + @divTrunc(tv.tv_usec, 1000);
+}
 
 // ============================================================================
 // Types
@@ -52,10 +66,14 @@ pub const Listener = struct {
     broadcast_ip: ?[4]u8,
     /// Client cache (for promisc interfaces)
     client_cache: ClientCache,
-    /// Ref channel for receiving packet refs to forward (zero-copy)
+    /// Ref channel for receiving packet refs to forward (zero-copy, thread mode)
     ref_channel: ?*sender.RefChannel,
-    /// Reference to the SendPktFeed for accessing packet data
+    /// Reference to the SendPktFeed for accessing packet data (thread mode)
     feed: ?*sender.SendPktFeed,
+    /// Coro ref channel for coroutine mode
+    coro_ref_channel: ?*sender.CoroRefChannel,
+    /// Reference to the CoroSendPktFeed (coroutine mode)
+    coro_feed: ?*sender.CoroSendPktFeed,
     /// Pre-allocated buffer pool for outgoing packets
     outgoing_pool: sender.OutgoingPool,
     /// Pcap dumper for incoming packets
@@ -77,6 +95,8 @@ pub const Listener = struct {
             .client_cache = ClientCache.init(allocator, config.cache_ttl_minutes),
             .ref_channel = null,
             .feed = null,
+            .coro_ref_channel = null,
+            .coro_feed = null,
             .outgoing_pool = sender.OutgoingPool.init(),
             .in_dumper = null,
             .out_dumper = null,
@@ -215,18 +235,24 @@ pub const Listener = struct {
         }
     }
 
-    /// Register with the send feed
+    /// Register with the send feed (thread mode)
     pub fn registerSender(self: *Listener, feed: *sender.SendPktFeed) !void {
         self.ref_channel = try feed.registerSender(self.config.iface_name);
         self.feed = feed;
     }
 
-    /// Main packet handling loop (zero-copy version)
+    /// Register with the coroutine-based send feed
+    pub fn registerCoroSender(self: *Listener, feed: *sender.CoroSendPktFeed) !void {
+        self.coro_ref_channel = try feed.registerSender(self.config.iface_name);
+        self.coro_feed = feed;
+    }
+
+    /// Main packet handling loop (zero-copy version, thread mode)
     pub fn run(self: *Listener, feed: *sender.SendPktFeed) void {
         self.running = true;
 
         // Cleanup timer (every 30 seconds - less aggressive than before)
-        var last_cleanup = std.time.milliTimestamp();
+        var last_cleanup = milliTimestamp();
         const cleanup_interval: i64 = 30000;
 
         log.debug("{s}: starting packet handler (send_only={})", .{ self.config.iface_name, self.config.send_only });
@@ -274,7 +300,7 @@ pub const Listener = struct {
             }
 
             // Periodic cleanup (less frequent, lazy expiration handles most cases)
-            const now = std.time.milliTimestamp();
+            const now = milliTimestamp();
             if (now - last_cleanup > cleanup_interval) {
                 self.client_cache.cleanup();
                 last_cleanup = now;
@@ -422,11 +448,230 @@ pub const Listener = struct {
         if (self.ref_channel) |channel| {
             channel.close();
         }
+        if (self.coro_ref_channel) |channel| {
+            channel.close();
+        }
     }
 
     /// Get interface name
     pub fn getName(self: *const Listener) []const u8 {
         return self.config.iface_name;
+    }
+
+    // =========================================================================
+    // Coroutine-based operation (zig-aio)
+    // =========================================================================
+
+    /// Main packet handling loop (coroutine version using zig-aio)
+    /// Must be called from within a coro.Scheduler context.
+    pub fn runCoro(self: *Listener, feed: *sender.CoroSendPktFeed) !void {
+        self.running = true;
+        defer self.running = false;
+
+        // Set pcap to non-blocking mode for cooperative polling
+        if (self.handle) |*handle| {
+            try handle.setNonBlock(true);
+        }
+
+        // Get the pcap file descriptor for polling
+        const pcap_fd: ?std.posix.fd_t = if (self.handle) |*handle|
+            handle.getSelectableFd()
+        else
+            null;
+
+        // Cleanup timer (every 30 seconds)
+        var last_cleanup = milliTimestamp();
+        const cleanup_interval: i64 = 30000;
+
+        log.debug("{s}: starting coro packet handler (send_only={})", .{
+            self.config.iface_name,
+            self.config.send_only,
+        });
+
+        while (self.running) {
+            if (self.config.send_only) {
+                // Send-only mode: use blocking receive on coro channel
+                if (self.coro_ref_channel) |channel| {
+                    const recv_result = channel.receive() catch |err| {
+                        if (err != error.Canceled) {
+                            log.warn("{s}: receive error: {}", .{ self.config.iface_name, err });
+                        }
+                        break;
+                    };
+                    if (recv_result) |ref| {
+                        self.sendPacketsFromCoroRef(ref) catch |err| {
+                            log.warn("{s}: failed to send packet: {}", .{ self.config.iface_name, err });
+                        };
+                    } else {
+                        // Channel closed
+                        break;
+                    }
+                    // Drain any additional queued packets
+                    while (channel.tryReceive()) |ref| {
+                        self.sendPacketsFromCoroRef(ref) catch |err| {
+                            log.warn("{s}: failed to send packet: {}", .{ self.config.iface_name, err });
+                        };
+                    }
+                }
+            } else {
+                // Normal mode: poll pcap fd and check channel
+
+                // Check for packets to send from other interfaces (non-blocking)
+                if (self.coro_ref_channel) |channel| {
+                    while (channel.tryReceive()) |ref| {
+                        self.sendPacketsFromCoroRef(ref) catch |err| {
+                            log.warn("{s}: failed to send packet: {}", .{ self.config.iface_name, err });
+                        };
+                    }
+                }
+
+                // Poll the pcap fd for readability, then capture
+                if (pcap_fd) |fd| {
+                    // Use coro.io.poll to cooperatively wait for the pcap fd
+                    // This yields to other coroutines while waiting
+                    coro.io.single(.poll, .{
+                        .fd = fd,
+                        .events = .{ .in = true },
+                    }) catch |err| {
+                        if (err != error.Canceled) {
+                            log.warn("{s}: poll error: {}", .{ self.config.iface_name, err });
+                        }
+                        break;
+                    };
+
+                    // Now capture packets (non-blocking since we set nonblock mode)
+                    self.capturePackets(feed);
+                } else {
+                    // No fd available (Windows?), fall back to timeout-based capture
+                    // Use a short timeout to yield to other coroutines
+                    coro.io.single(.timeout, .{ .ns = 10 * std.time.ns_per_ms }) catch |err| {
+                        if (err != error.Canceled) {
+                            log.warn("{s}: timeout error: {}", .{ self.config.iface_name, err });
+                        }
+                        break;
+                    };
+                    self.capturePackets(feed);
+                }
+            }
+
+            // Periodic cleanup
+            const now = milliTimestamp();
+            if (now - last_cleanup > cleanup_interval) {
+                self.client_cache.cleanup();
+                last_cleanup = now;
+            }
+        }
+
+        log.debug("{s}: coro packet handler stopped", .{self.config.iface_name});
+    }
+
+    /// Capture and process available packets
+    fn capturePackets(self: *Listener, feed: *sender.CoroSendPktFeed) void {
+        if (self.handle) |*handle| {
+            // Capture all available packets (non-blocking)
+            while (true) {
+                if (handle.nextPacket()) |result| {
+                    if (result) |pkt_data| {
+                        self.handleIncomingPacketCoro(pkt_data.data, pkt_data.info, feed);
+                    } else {
+                        // No more packets available
+                        break;
+                    }
+                } else |err| {
+                    if (err != pcap.Error.NoMorePackets) {
+                        log.warn("{s}: capture error: {}", .{ self.config.iface_name, err });
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Handle an incoming packet (coroutine version)
+    fn handleIncomingPacketCoro(
+        self: *Listener,
+        data: []const u8,
+        info: pcap.CaptureInfo,
+        feed: *sender.CoroSendPktFeed,
+    ) void {
+        // Parse the packet
+        const parsed = packet.parsePacket(data, self.link_type) catch |err| {
+            log.debug("{s}: failed to parse packet: {}", .{ self.config.iface_name, err });
+            return;
+        };
+
+        // Learn client IP for promiscuous interfaces
+        if (self.config.promisc) {
+            if (parsed.getSrcIp()) |src_ip| {
+                self.client_cache.learn(src_ip) catch {};
+            }
+        }
+
+        // Write to debug pcap
+        if (self.in_dumper) |*d| {
+            d.writePacket(info, data);
+        }
+
+        // Broadcast to other interfaces
+        log.debug("{s}: forwarding packet ({d} bytes)", .{ self.config.iface_name, data.len });
+
+        feed.broadcast(
+            data,
+            self.config.iface_name,
+            self.link_type,
+            info.timestamp_sec,
+            info.timestamp_usec,
+        );
+    }
+
+    /// Send packets from a coro packet reference
+    fn sendPacketsFromCoroRef(self: *Listener, ref: sender.PacketRef) !void {
+        // Get packet data from the shared ring buffer
+        const pkt_data = if (self.coro_feed) |feed|
+            feed.getPacketData(ref.ring_idx)
+        else
+            return error.NoFeed;
+
+        // Parse the incoming packet
+        const parsed = packet.parsePacket(pkt_data, ref.link_type) catch |err| {
+            log.warn("{s}: failed to parse packet from {s}: {}", .{
+                self.config.iface_name,
+                ref.src_interface,
+                err,
+            });
+            return;
+        };
+
+        // Determine destination IPs
+        if (!self.config.promisc) {
+            // Non-promiscuous: send to broadcast address
+            if (self.broadcast_ip) |bcast_ip| {
+                try self.sendToDestinationZeroCopy(parsed, bcast_ip, ref);
+            }
+        } else {
+            // Promiscuous: iterate clients without allocation
+            var client_iter = self.client_cache.iterator();
+            var sent_count: usize = 0;
+
+            while (client_iter.next()) |client_ip| {
+                self.sendToDestinationZeroCopy(parsed, client_ip, ref) catch |err| {
+                    log.warn("{s}: failed to send to {d}.{d}.{d}.{d}: {}", .{
+                        self.config.iface_name,
+                        client_ip[0],
+                        client_ip[1],
+                        client_ip[2],
+                        client_ip[3],
+                        err,
+                    });
+                    continue;
+                };
+                sent_count += 1;
+            }
+
+            if (sent_count == 0) {
+                log.debug("{s}: no clients to forward to", .{self.config.iface_name});
+            }
+        }
     }
 };
 

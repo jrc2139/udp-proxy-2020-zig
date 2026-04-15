@@ -7,6 +7,13 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const coro = @import("coro");
+const c_sys = @cImport({
+    @cInclude("fcntl.h");
+    @cInclude("unistd.h");
+    @cInclude("time.h");
+    @cInclude("sys/time.h");
+});
 
 const pcap = @import("pcap.zig");
 const packet = @import("packet.zig");
@@ -43,6 +50,7 @@ const Args = struct {
     list_interfaces: bool = false,
     show_version: bool = false,
     no_listen: bool = false,
+    use_coro: bool = false,
 
     const FixedIp = struct {
         interface: [:0]const u8,
@@ -51,9 +59,9 @@ const Args = struct {
 
     fn init() Args {
         return Args{
-            .interfaces = .{},
-            .fixed_ips = .{},
-            .ports = .{},
+            .interfaces = .empty,
+            .fixed_ips = .empty,
+            .ports = .empty,
         };
     }
 
@@ -82,8 +90,8 @@ pub const std_options: std.Options = .{
 };
 
 var runtime_log_level: std.log.Level = .info;
-var log_file: ?std.fs.File = null;
-var log_mutex: std.Thread.Mutex = .{};
+var log_file: ?std.Io.File = null;
+var log_mutex: std.Io.Mutex = std.Io.Mutex.init;
 const default_log_path = "/tmp/udp-proxy-2020.log";
 
 fn customLog(
@@ -105,9 +113,10 @@ fn customLog(
 
     const scope_prefix = if (scope == .default) "" else "[" ++ @tagName(scope) ++ "] ";
 
-    // Get current timestamp
-    const timestamp = std.time.timestamp();
-    const epoch_secs: u64 = @intCast(timestamp);
+    // Get current timestamp via POSIX gettimeofday (std.time.timestamp removed in 0.16)
+    var tv: c_sys.struct_timeval = undefined;
+    _ = c_sys.gettimeofday(&tv, null);
+    const epoch_secs: u64 = @intCast(tv.tv_sec);
     const epoch_day = std.time.epoch.EpochDay{ .day = @intCast(@divFloor(epoch_secs, std.time.s_per_day)) };
     const year_day = epoch_day.calculateYearDay();
     const month_day = year_day.calculateMonthDay();
@@ -130,39 +139,44 @@ fn customLog(
     } ++ args) catch return;
 
     // Lock for thread safety and write atomically
-    log_mutex.lock();
-    defer log_mutex.unlock();
+    log_mutex.lockUncancelable(undefined);
+    defer log_mutex.unlock(undefined);
 
-    const output_file = log_file orelse std.fs.File.stderr();
-    _ = output_file.write(msg) catch {};
+    // Write via POSIX fd to avoid requiring io (std.Io.File.write requires io)
+    const fd: std.Io.File.Handle = if (log_file) |f| f.handle else std.Io.File.stderr().handle;
+    _ = c_sys.write(fd, msg.ptr, msg.len);
 }
 
 fn initLogFile(path: ?[]const u8) !void {
     const log_path = path orelse default_log_path;
-    // Open with append mode
-    log_file = try std.fs.cwd().openFile(log_path, .{ .mode = .write_only });
-    log_file.?.seekFromEnd(0) catch {};
+    // Open with O_WRONLY using POSIX open (std.fs.cwd().openFile requires io in 0.16)
+    var path_buf: [512]u8 = undefined;
+    const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{log_path}) catch return error.PathTooLong;
+    const fd = c_sys.open(path_z.ptr, c_sys.O_WRONLY, @as(c_int, 0o644));
+    if (fd < 0) return error.FileNotFound;
+    _ = c_sys.lseek(fd, 0, c_sys.SEEK_END);
+    log_file = std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
 }
 
 fn initLogFileCreate(path: ?[]const u8) !void {
     const log_path = path orelse default_log_path;
-    // Create if doesn't exist, open for append
-    log_file = std.fs.cwd().openFile(log_path, .{ .mode = .write_only }) catch |err| {
-        if (err == error.FileNotFound) {
-            return try createLogFile(log_path);
-        }
-        return err;
-    };
-    log_file.?.seekFromEnd(0) catch {};
-}
-
-fn createLogFile(path: []const u8) !void {
-    log_file = try std.fs.cwd().createFile(path, .{});
+    // Create if doesn't exist, open for append using POSIX
+    var path_buf: [512]u8 = undefined;
+    const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{log_path}) catch return error.PathTooLong;
+    // Try open first; create if missing
+    var fd = c_sys.open(path_z.ptr, c_sys.O_WRONLY, @as(c_int, 0o644));
+    if (fd < 0) {
+        fd = c_sys.open(path_z.ptr, c_sys.O_WRONLY | c_sys.O_CREAT | c_sys.O_TRUNC, @as(c_int, 0o644));
+        if (fd < 0) return error.OpenFailed;
+    } else {
+        _ = c_sys.lseek(fd, 0, c_sys.SEEK_END);
+    }
+    log_file = std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
 }
 
 fn deinitLogFile() void {
     if (log_file) |f| {
-        f.close();
+        _ = c_sys.close(f.handle);
         log_file = null;
     }
 }
@@ -171,9 +185,13 @@ fn deinitLogFile() void {
 // Main
 // ============================================================================
 
-pub fn main() !void {
-    // Use GPA for leak detection in debug builds
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(proc_init: std.process.Init.Minimal) !void {
+    // Initialize Io for file I/O operations
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
+
+    // Use DebugAllocator for leak detection in debug builds (replaces GPA in 0.16)
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer {
         const check = gpa.deinit();
         if (check == .leak) {
@@ -186,7 +204,7 @@ pub fn main() !void {
     var args = Args.init();
     defer args.deinit(allocator);
 
-    parseArgs(allocator, &args) catch |err| {
+    parseArgs(allocator, &args, proc_init.args) catch |err| {
         log.err("Failed to parse arguments: {}", .{err});
         std.process.exit(1);
     };
@@ -200,7 +218,7 @@ pub fn main() !void {
             // Fall back to stderr if we can't open log file
             var err_buf: [256]u8 = undefined;
             const msg = std.fmt.bufPrint(&err_buf, "Warning: Could not open log file: {}\n", .{err}) catch "Warning: Could not open log file\n";
-            _ = std.fs.File.stderr().write(msg) catch {};
+            _ = c_sys.write(std.Io.File.stderr().handle, msg.ptr, msg.len);
         };
     }
     defer deinitLogFile();
@@ -208,8 +226,8 @@ pub fn main() !void {
     // Handle --version
     if (args.show_version) {
         var buf: [4096]u8 = undefined;
-        const stdout = std.fs.File.stdout();
-        var writer = stdout.writer(&buf);
+        const stdout = std.Io.File.stdout();
+        var writer = stdout.writer(io, &buf);
         try writer.interface.print("udp-proxy-2020 (Zig) Version {s}\n", .{version});
         try writer.interface.print("{s} built with Zig {s}\n", .{ build_info, builtin.zig_version_string });
         try writer.interface.flush();
@@ -218,7 +236,7 @@ pub fn main() !void {
 
     // Handle --list-interfaces
     if (args.list_interfaces) {
-        try listInterfaces(allocator);
+        try listInterfaces(io, allocator);
         return;
     }
 
@@ -255,12 +273,26 @@ pub fn main() !void {
     };
     defer pcap.freeDevices(allocator, interfaces);
 
+    // Branch based on execution mode
+    if (args.use_coro) {
+        try runWithCoroutines(allocator, &args, interfaces);
+    } else {
+        try runWithThreads(allocator, &args, interfaces);
+    }
+}
+
+/// Run the proxy using traditional thread-per-interface model
+fn runWithThreads(
+    allocator: std.mem.Allocator,
+    args: *Args,
+    interfaces: []const pcap.Interface,
+) !void {
     // Create packet feed (with shared ring buffer for zero-copy broadcast)
     var feed = try sender.SendPktFeed.init(allocator);
     defer feed.deinit();
 
     // Create listeners
-    var listeners = std.ArrayListUnmanaged(Listener){};
+    var listeners = std.ArrayListUnmanaged(Listener).empty;
     defer {
         for (listeners.items) |*l| {
             l.deinit();
@@ -296,7 +328,7 @@ pub fn main() !void {
         }
 
         // Collect fixed IPs for this interface
-        var fixed_ips = std.ArrayListUnmanaged([4]u8){};
+        var fixed_ips = std.ArrayListUnmanaged([4]u8).empty;
         defer fixed_ips.deinit(allocator);
 
         for (args.fixed_ips.items) |fip| {
@@ -379,10 +411,10 @@ pub fn main() !void {
     }
     defer if (sink) |*s| s.deinit();
 
-    log.info("Initialization complete! Starting packet handlers...", .{});
+    log.info("Initialization complete! Starting packet handlers (thread mode)...", .{});
 
     // Start listener threads
-    var threads = std.ArrayListUnmanaged(std.Thread){};
+    var threads = std.ArrayListUnmanaged(std.Thread).empty;
     defer {
         for (threads.items) |thread| {
             thread.join();
@@ -401,16 +433,165 @@ pub fn main() !void {
     }
 }
 
+/// Run the proxy using coroutine-based scheduler (zig-aio)
+fn runWithCoroutines(
+    allocator: std.mem.Allocator,
+    args: *Args,
+    interfaces: []const pcap.Interface,
+) !void {
+    // Create coroutine-based packet feed
+    var coro_feed = try sender.CoroSendPktFeed.init(allocator);
+    defer coro_feed.deinit();
+
+    // Create listeners
+    var listeners = std.ArrayListUnmanaged(Listener).empty;
+    defer {
+        for (listeners.items) |*l| {
+            l.deinit();
+        }
+        listeners.deinit(allocator);
+    }
+
+    for (args.interfaces.items) |iface_name| {
+        // Check for duplicates
+        for (listeners.items) |existing| {
+            if (std.mem.eql(u8, existing.getName(), iface_name)) {
+                log.err("Can't specify the same interface ({s}) multiple times", .{iface_name});
+                std.process.exit(1);
+            }
+        }
+
+        // Determine if this interface needs promiscuous mode
+        var promisc = false;
+        for (interfaces) |iface| {
+            if (std.mem.eql(u8, iface.name, iface_name[0..iface_name.len])) {
+                var has_broadcast = false;
+                for (iface.addresses) |addr| {
+                    if (addr.broadcast != null) {
+                        has_broadcast = true;
+                        break;
+                    }
+                }
+                promisc = !has_broadcast;
+                break;
+            }
+        }
+
+        // Collect fixed IPs for this interface
+        var fixed_ips = std.ArrayListUnmanaged([4]u8).empty;
+        defer fixed_ips.deinit(allocator);
+
+        for (args.fixed_ips.items) |fip| {
+            if (std.mem.eql(u8, fip.interface, iface_name)) {
+                try fixed_ips.append(allocator, fip.ip);
+            }
+        }
+
+        const config = ListenerConfig{
+            .iface_name = iface_name,
+            .ports = args.ports.items,
+            .timeout_ms = args.timeout_ms,
+            .cache_ttl_minutes = args.cache_ttl,
+            .fixed_ips = try allocator.dupe([4]u8, fixed_ips.items),
+            .promisc = promisc,
+            .send_only = false,
+            .pcap_debug = args.pcap_debug,
+            .pcap_path = args.pcap_path,
+        };
+
+        var listener = try Listener.init(allocator, config);
+        errdefer listener.deinit();
+
+        try listener.open(interfaces);
+        try listener.registerCoroSender(&coro_feed);
+
+        try listeners.append(allocator, listener);
+    }
+
+    // Add loopback listener if deliver-local is enabled
+    if (args.deliver_local) {
+        if (try pcap.findLoopback(allocator)) |loopback_name| {
+            defer allocator.free(loopback_name);
+
+            const lb_name = try allocator.allocSentinel(u8, loopback_name.len, 0);
+            @memcpy(lb_name, loopback_name);
+
+            const config = ListenerConfig{
+                .iface_name = lb_name,
+                .ports = args.ports.items,
+                .timeout_ms = args.timeout_ms,
+                .cache_ttl_minutes = args.cache_ttl,
+                .fixed_ips = &[_][4]u8{.{ 127, 0, 0, 1 }},
+                .promisc = false,
+                .send_only = true,
+                .pcap_debug = args.pcap_debug,
+                .pcap_path = args.pcap_path,
+            };
+
+            var listener = try Listener.init(allocator, config);
+            errdefer listener.deinit();
+
+            try listener.open(interfaces);
+            try listener.registerCoroSender(&coro_feed);
+
+            try listeners.append(allocator, listener);
+        } else {
+            log.warn("Could not find loopback interface for --deliver-local", .{});
+        }
+    }
+
+    // Start UDP sinks (unless --no-listen)
+    var sink: ?UdpSink = null;
+    if (!args.no_listen) {
+        sink = UdpSink.init(allocator);
+
+        for (interfaces) |iface| {
+            for (args.interfaces.items) |wanted| {
+                if (std.mem.eql(u8, iface.name, wanted[0..wanted.len])) {
+                    for (iface.addresses) |addr| {
+                        if (addr.addr) |ip| {
+                            for (args.ports.items) |port| {
+                                sink.?.bind(ip, port) catch {};
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    defer if (sink) |*s| s.deinit();
+
+    log.info("Initialization complete! Starting packet handlers (coro mode)...", .{});
+
+    // Create scheduler and spawn listener coroutines
+    var scheduler = try coro.Scheduler.init(allocator, .{});
+    defer scheduler.deinit();
+
+    // Spawn a coroutine for each listener
+    for (listeners.items) |*listener| {
+        _ = try scheduler.spawn(runListenerCoro, .{ listener, &coro_feed }, .{});
+    }
+
+    // Run until all coroutines complete (they run forever unless stopped)
+    try scheduler.run(.wait);
+}
+
 fn runListener(listener: *Listener, feed: *sender.SendPktFeed) void {
     listener.run(feed);
+}
+
+fn runListenerCoro(listener: *Listener, feed: *sender.CoroSendPktFeed) void {
+    listener.runCoro(feed) catch |err| {
+        log.err("{s}: coroutine error: {}", .{ listener.getName(), err });
+    };
 }
 
 // ============================================================================
 // Argument Parsing
 // ============================================================================
 
-fn parseArgs(allocator: std.mem.Allocator, args: *Args) !void {
-    var arg_iter = std.process.args();
+fn parseArgs(allocator: std.mem.Allocator, args: *Args, proc_args: std.process.Args) !void {
+    var arg_iter = std.process.Args.Iterator.init(proc_args);
     _ = arg_iter.skip(); // Skip program name
 
     while (arg_iter.next()) |arg| {
@@ -495,6 +676,8 @@ fn parseArgs(allocator: std.mem.Allocator, args: *Args) !void {
             args.show_version = true;
         } else if (std.mem.eql(u8, arg, "--no-listen")) {
             args.no_listen = true;
+        } else if (std.mem.eql(u8, arg, "--coro")) {
+            args.use_coro = true;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             printHelp();
             std.process.exit(0);
@@ -507,10 +690,7 @@ fn parseArgs(allocator: std.mem.Allocator, args: *Args) !void {
 }
 
 fn printHelp() void {
-    var buf: [4096]u8 = undefined;
-    const stdout = std.fs.File.stdout();
-    var writer = stdout.writer(&buf);
-    writer.interface.print(
+    const help =
         \\udp-proxy-2020 (Zig) - A UDP broadcast packet forwarder
         \\
         \\Usage: udp-proxy-2020 [OPTIONS]
@@ -529,6 +709,7 @@ fn printHelp() void {
         \\  -d, --pcap-path <DIR>       Directory for pcap debug files (default: /tmp)
         \\      --list-interfaces       List available interfaces and exit
         \\      --no-listen             Don't bind UDP sockets (use if another app needs the port)
+        \\      --coro                  Use coroutine-based scheduler (zig-aio)
         \\  -v, --version               Show version and exit
         \\  -h, --help                  Show this help
         \\
@@ -536,21 +717,21 @@ fn printHelp() void {
         \\  udp-proxy-2020 -i eth0,eth1,tun0 -p 9003 -T 300
         \\
         \\
-    , .{}) catch {};
-    writer.interface.flush() catch {};
+    ;
+    _ = c_sys.write(std.Io.File.stdout().handle, help.ptr, help.len);
 }
 
 // ============================================================================
 // List Interfaces
 // ============================================================================
 
-fn listInterfaces(allocator: std.mem.Allocator) !void {
+fn listInterfaces(io: std.Io, allocator: std.mem.Allocator) !void {
     const interfaces = try pcap.findAllDevices(allocator);
     defer pcap.freeDevices(allocator, interfaces);
 
     var buf: [4096]u8 = undefined;
-    const stdout = std.fs.File.stdout();
-    var writer = stdout.writer(&buf);
+    const stdout = std.Io.File.stdout();
+    var writer = stdout.writer(io, &buf);
     const w = &writer.interface;
 
     for (interfaces) |iface| {

@@ -9,8 +9,19 @@
 //! that never invalidates in-flight iterations.
 
 const std = @import("std");
+const c_time = @cImport({
+    @cInclude("sys/time.h");
+});
 
 const log = std.log.scoped(.client_cache);
+
+/// Return milliseconds since Unix epoch using POSIX gettimeofday.
+/// Replaces milliTimestamp() which was removed in Zig 0.16.
+fn milliTimestamp() i64 {
+    var tv: c_time.struct_timeval = undefined;
+    _ = c_time.gettimeofday(&tv, null);
+    return @as(i64, tv.tv_sec) * 1000 + @divTrunc(tv.tv_usec, 1000);
+}
 
 // ============================================================================
 // Types
@@ -35,7 +46,7 @@ pub const ClientCache = struct {
     /// TTL in milliseconds
     ttl_ms: i64,
     /// Mutex for thread safety
-    mutex: std.Thread.Mutex,
+    mutex: std.Io.Mutex,
     /// Cleanup epoch - incremented on each cleanup to signal iterators
     cleanup_epoch: std.atomic.Value(u64),
 
@@ -47,22 +58,22 @@ pub const ClientCache = struct {
             .clients = std.AutoHashMap([4]u8, ClientEntry).init(allocator),
             .allocator = allocator,
             .ttl_ms = ttl_ms,
-            .mutex = .{},
+            .mutex = std.Io.Mutex.init,
             .cleanup_epoch = std.atomic.Value(u64).init(0),
         };
     }
 
     /// Deinitialize the cache
     pub fn deinit(self: *ClientCache) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(undefined);
+        defer self.mutex.unlock(undefined);
         self.clients.deinit();
     }
 
     /// Add a fixed IP that never expires
     pub fn addFixed(self: *ClientCache, ip: [4]u8) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(undefined);
+        defer self.mutex.unlock(undefined);
 
         // Check if already exists as fixed
         if (self.clients.get(ip)) |existing| {
@@ -81,10 +92,10 @@ pub const ClientCache = struct {
 
     /// Learn a client IP (update TTL if exists)
     pub fn learn(self: *ClientCache, ip: [4]u8) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(undefined);
+        defer self.mutex.unlock(undefined);
 
-        const now = std.time.milliTimestamp();
+        const now = milliTimestamp();
         const expires_at: i64 = now + self.ttl_ms;
 
         // Check if already exists
@@ -127,17 +138,17 @@ pub const ClientCache = struct {
     pub fn iterator(self: *ClientCache) ClientIterator {
         return ClientIterator{
             .inner = self.clients.iterator(),
-            .now = std.time.milliTimestamp(),
+            .now = milliTimestamp(),
         };
     }
 
     /// Get all valid (non-expired) client IPs (allocating version for legacy compatibility)
     /// Caller must free the returned slice
     pub fn getClients(self: *ClientCache, allocator: std.mem.Allocator) ![][4]u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(undefined);
+        defer self.mutex.unlock(undefined);
 
-        const now = std.time.milliTimestamp();
+        const now = milliTimestamp();
 
         // Count valid clients first
         var valid_count: usize = 0;
@@ -165,13 +176,13 @@ pub const ClientCache = struct {
     /// Remove expired entries
     /// Uses deferred removal to avoid invalidating concurrent iterators
     pub fn cleanup(self: *ClientCache) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(undefined);
+        defer self.mutex.unlock(undefined);
 
-        const now = std.time.milliTimestamp();
+        const now = milliTimestamp();
 
         // Collect keys to remove (can't remove during iteration)
-        var to_remove = std.ArrayListUnmanaged([4]u8){};
+        var to_remove = std.ArrayListUnmanaged([4]u8).empty;
         defer to_remove.deinit(self.allocator);
 
         var iter = self.clients.iterator();
@@ -193,20 +204,20 @@ pub const ClientCache = struct {
 
     /// Get the number of clients (including expired)
     pub fn count(self: *ClientCache) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(undefined);
+        defer self.mutex.unlock(undefined);
         return self.clients.count();
     }
 
     /// Check if a client exists
     pub fn contains(self: *ClientCache, ip: [4]u8) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(undefined);
+        defer self.mutex.unlock(undefined);
 
         if (self.clients.get(ip)) |entry| {
             if (entry.is_fixed) return true;
 
-            const now = std.time.milliTimestamp();
+            const now = milliTimestamp();
             return entry.expires_at > now;
         }
         return false;

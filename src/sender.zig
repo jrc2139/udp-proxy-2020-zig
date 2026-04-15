@@ -8,8 +8,14 @@
 //! Packets are stored once in a shared ring buffer, and lightweight refs
 //! are passed through channels. This eliminates per-packet allocation and
 //! minimizes lock hold time.
+//!
+//! Two channel implementations are available:
+//! - RefChannel: Thread-based with mutex (for traditional threading model)
+//! - CoroRefChannel: Coroutine-based using zig-aio (for async model)
 
 const std = @import("std");
+const aio = @import("aio");
+const coro = @import("coro");
 const pcap = @import("pcap.zig");
 const packet = @import("packet.zig");
 
@@ -175,15 +181,15 @@ const PacketQueue = struct {
 /// Channel for receiving packet references (zero-copy)
 pub const RefChannel = struct {
     queue: RefQueue,
-    mutex: std.Thread.Mutex,
-    cond: std.Thread.Condition,
+    mutex: std.Io.Mutex,
+    cond: std.Io.Condition,
     closed: bool,
 
     pub fn init() RefChannel {
         return RefChannel{
             .queue = RefQueue.init(),
-            .mutex = .{},
-            .cond = .{},
+            .mutex = std.Io.Mutex.init,
+            .cond = std.Io.Condition.init,
             .closed = false,
         };
     }
@@ -194,24 +200,24 @@ pub const RefChannel = struct {
 
     /// Send a packet ref to this channel
     pub fn send(self: *RefChannel, ref: PacketRef) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(undefined);
+        defer self.mutex.unlock(undefined);
 
         if (self.closed) return error.ChannelClosed;
 
         if (!self.queue.push(ref)) {
             return error.QueueFull;
         }
-        self.cond.signal();
+        self.cond.signal(undefined);
     }
 
     /// Receive a packet ref from this channel (blocking)
     pub fn receive(self: *RefChannel) ?PacketRef {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(undefined);
+        defer self.mutex.unlock(undefined);
 
         while (self.queue.count == 0 and !self.closed) {
-            self.cond.wait(&self.mutex);
+            self.cond.waitUncancelable(undefined, &self.mutex);
         }
 
         if (self.closed and self.queue.count == 0) {
@@ -223,33 +229,191 @@ pub const RefChannel = struct {
 
     /// Try to receive without blocking
     pub fn tryReceive(self: *RefChannel) ?PacketRef {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(undefined);
+        defer self.mutex.unlock(undefined);
 
         return self.queue.pop();
     }
 
     /// Close the channel
     pub fn close(self: *RefChannel) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(undefined);
+        defer self.mutex.unlock(undefined);
         self.closed = true;
-        self.cond.broadcast();
+        self.cond.broadcast(undefined);
+    }
+};
+
+// ============================================================================
+// Coroutine-based Channel (zig-aio)
+// ============================================================================
+
+/// Coroutine-compatible channel for packet references using zig-aio.
+/// Uses coro.Queue internally for efficient async communication.
+/// Must be used within a coro.Scheduler context.
+pub const CoroRefChannel = struct {
+    queue: coro.Queue(PacketRef),
+    closed: std.atomic.Value(bool),
+
+    pub fn init(allocator: std.mem.Allocator) !CoroRefChannel {
+        return CoroRefChannel{
+            .queue = try coro.Queue(PacketRef).init(allocator, 256),
+            .closed = std.atomic.Value(bool).init(false),
+        };
+    }
+
+    pub fn deinit(self: *CoroRefChannel) void {
+        self.queue.deinit();
+    }
+
+    /// Send a packet ref (works from both coroutine and thread context)
+    pub fn send(self: *CoroRefChannel, ref: PacketRef) !void {
+        if (self.closed.load(.acquire)) return error.ChannelClosed;
+        try self.queue.send(ref);
+    }
+
+    /// Receive a packet ref (blocking, requires coroutine context)
+    pub fn receive(self: *CoroRefChannel) !?PacketRef {
+        if (self.closed.load(.acquire)) return null;
+        return try self.queue.recv();
+    }
+
+    /// Try to receive without blocking (works in any context)
+    pub fn tryReceive(self: *CoroRefChannel) ?PacketRef {
+        if (self.closed.load(.acquire)) return null;
+        return self.queue.tryRecv();
+    }
+
+    /// Close the channel
+    pub fn close(self: *CoroRefChannel) void {
+        self.closed.store(true, .release);
+    }
+};
+
+/// Coroutine-based packet feed using zig-aio channels.
+/// Manages packet distribution to all registered interfaces.
+pub const CoroSendPktFeed = struct {
+    /// Map of interface name to coro channel
+    senders: std.StringHashMap(*CoroRefChannel),
+    /// Shared packet ring buffer
+    ring: *PacketRing,
+    /// Allocator
+    allocator: std.mem.Allocator,
+    /// Mutex for sender registration (write operations only)
+    /// Broadcast uses atomic operations, no lock needed
+    registration_mutex: std.Io.Mutex,
+
+    pub fn init(allocator: std.mem.Allocator) !CoroSendPktFeed {
+        const ring = try allocator.create(PacketRing);
+        ring.* = PacketRing.init();
+
+        return CoroSendPktFeed{
+            .senders = std.StringHashMap(*CoroRefChannel).init(allocator),
+            .ring = ring,
+            .allocator = allocator,
+            .registration_mutex = std.Io.Mutex.init,
+        };
+    }
+
+    pub fn deinit(self: *CoroSendPktFeed) void {
+        self.registration_mutex.lockUncancelable(undefined);
+        defer self.registration_mutex.unlock(undefined);
+
+        var key_iter = self.senders.keyIterator();
+        while (key_iter.next()) |key| {
+            self.allocator.free(key.*);
+        }
+
+        var value_iter = self.senders.valueIterator();
+        while (value_iter.next()) |channel| {
+            channel.*.close();
+            channel.*.deinit();
+            self.allocator.destroy(channel.*);
+        }
+        self.senders.deinit();
+        self.allocator.destroy(self.ring);
+    }
+
+    /// Register a channel for an interface
+    pub fn registerSender(self: *CoroSendPktFeed, iface_name: []const u8) !*CoroRefChannel {
+        self.registration_mutex.lockUncancelable(undefined);
+        defer self.registration_mutex.unlock(undefined);
+
+        const channel = try self.allocator.create(CoroRefChannel);
+        channel.* = try CoroRefChannel.init(self.allocator);
+
+        const name_copy = try self.allocator.dupe(u8, iface_name);
+        try self.senders.put(name_copy, channel);
+
+        log.debug("Registered coro sender for interface: {s}", .{iface_name});
+        return channel;
+    }
+
+    /// Get packet data from the shared ring buffer
+    pub fn getPacketData(self: *const CoroSendPktFeed, ring_idx: u8) []const u8 {
+        return self.ring.get(ring_idx);
+    }
+
+    /// Broadcast a packet to all interfaces except source (zero-copy)
+    pub fn broadcast(
+        self: *CoroSendPktFeed,
+        data: []const u8,
+        src_interface: []const u8,
+        link_type: pcap.LinkType,
+        timestamp_sec: i64,
+        timestamp_usec: i64,
+    ) void {
+        if (data.len > MAX_PACKET_SIZE) {
+            log.warn("Packet too large to broadcast: {d} bytes", .{data.len});
+            return;
+        }
+
+        // Store packet data in ring buffer
+        const ring_idx = self.ring.store(data);
+
+        // Create lightweight ref
+        const ref = PacketRef{
+            .ring_idx = ring_idx,
+            .link_type = link_type,
+            .src_interface = src_interface,
+            .timestamp_sec = timestamp_sec,
+            .timestamp_usec = timestamp_usec,
+        };
+
+        // Send to all channels except source
+        // Note: We don't hold a lock during iteration because:
+        // 1. Registration only happens at startup
+        // 2. The HashMap iteration is safe if no modifications occur
+        var iter = self.senders.iterator();
+        while (iter.next()) |entry| {
+            if (std.mem.eql(u8, entry.key_ptr.*, src_interface)) {
+                continue;
+            }
+
+            entry.value_ptr.*.send(ref) catch |err| {
+                log.warn("Failed to send ref to {s}: {}", .{ entry.key_ptr.*, err });
+            };
+        }
+    }
+
+    /// Get the number of registered senders
+    pub fn count(self: *CoroSendPktFeed) usize {
+        return self.senders.count();
     }
 };
 
 /// Legacy channel for full packets (kept for compatibility)
 pub const SendChannel = struct {
     queue: PacketQueue,
-    mutex: std.Thread.Mutex,
-    cond: std.Thread.Condition,
+    mutex: std.Io.Mutex,
+    cond: std.Io.Condition,
     closed: bool,
 
     pub fn init() SendChannel {
         return SendChannel{
             .queue = PacketQueue.init(),
-            .mutex = .{},
-            .cond = .{},
+            .mutex = std.Io.Mutex.init,
+            .cond = std.Io.Condition.init,
             .closed = false,
         };
     }
@@ -260,24 +424,24 @@ pub const SendChannel = struct {
 
     /// Send a packet to this channel
     pub fn send(self: *SendChannel, pkt: SendPacket) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(undefined);
+        defer self.mutex.unlock(undefined);
 
         if (self.closed) return error.ChannelClosed;
 
         if (!self.queue.push(pkt)) {
             return error.QueueFull;
         }
-        self.cond.signal();
+        self.cond.signal(undefined);
     }
 
     /// Receive a packet from this channel (blocking)
     pub fn receive(self: *SendChannel) ?SendPacket {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(undefined);
+        defer self.mutex.unlock(undefined);
 
         while (self.queue.count == 0 and !self.closed) {
-            self.cond.wait(&self.mutex);
+            self.cond.waitUncancelable(undefined, &self.mutex);
         }
 
         if (self.closed and self.queue.count == 0) {
@@ -289,18 +453,18 @@ pub const SendChannel = struct {
 
     /// Try to receive without blocking
     pub fn tryReceive(self: *SendChannel) ?SendPacket {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(undefined);
+        defer self.mutex.unlock(undefined);
 
         return self.queue.pop();
     }
 
     /// Close the channel
     pub fn close(self: *SendChannel) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(undefined);
+        defer self.mutex.unlock(undefined);
         self.closed = true;
-        self.cond.broadcast();
+        self.cond.broadcast(undefined);
     }
 };
 
@@ -315,7 +479,7 @@ pub const SendPktFeed = struct {
     /// Allocator
     allocator: std.mem.Allocator,
     /// RwLock for concurrent broadcast (read) vs exclusive registration (write)
-    rwlock: std.Thread.RwLock,
+    rwlock: std.Io.RwLock,
 
     pub fn init(allocator: std.mem.Allocator) !SendPktFeed {
         const ring = try allocator.create(PacketRing);
@@ -325,13 +489,13 @@ pub const SendPktFeed = struct {
             .senders = std.StringHashMap(*RefChannel).init(allocator),
             .ring = ring,
             .allocator = allocator,
-            .rwlock = .{},
+            .rwlock = std.Io.RwLock.init,
         };
     }
 
     pub fn deinit(self: *SendPktFeed) void {
-        self.rwlock.lock();
-        defer self.rwlock.unlock();
+        self.rwlock.lockUncancelable(undefined);
+        defer self.rwlock.unlock(undefined);
 
         var key_iter = self.senders.keyIterator();
         while (key_iter.next()) |key| {
@@ -350,8 +514,8 @@ pub const SendPktFeed = struct {
 
     /// Register a ref channel for an interface (exclusive write lock)
     pub fn registerSender(self: *SendPktFeed, iface_name: []const u8) !*RefChannel {
-        self.rwlock.lock();
-        defer self.rwlock.unlock();
+        self.rwlock.lockUncancelable(undefined);
+        defer self.rwlock.unlock(undefined);
 
         // Create new channel
         const channel = try self.allocator.create(RefChannel);
@@ -401,8 +565,8 @@ pub const SendPktFeed = struct {
         };
 
         // Shared read lock - allows concurrent broadcasts from multiple interfaces
-        self.rwlock.lockShared();
-        defer self.rwlock.unlockShared();
+        self.rwlock.lockSharedUncancelable(undefined);
+        defer self.rwlock.unlockShared(undefined);
 
         var iter = self.senders.iterator();
         while (iter.next()) |entry| {
@@ -419,8 +583,8 @@ pub const SendPktFeed = struct {
 
     /// Get the number of registered senders
     pub fn count(self: *SendPktFeed) usize {
-        self.rwlock.lockShared();
-        defer self.rwlock.unlockShared();
+        self.rwlock.lockSharedUncancelable(undefined);
+        defer self.rwlock.unlockShared(undefined);
         return self.senders.count();
     }
 };
