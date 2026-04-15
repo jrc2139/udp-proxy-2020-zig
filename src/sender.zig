@@ -6,12 +6,13 @@
 //!
 //! Design: Zero-copy packet broadcast using ring buffers and references.
 //! Packets are stored once in a shared ring buffer, and lightweight refs
-//! are passed through channels. This eliminates per-packet allocation and
-//! minimizes lock hold time.
+//! are passed through lock-free MPSC channels. This eliminates per-packet
+//! allocation and avoids mutex overhead in the hot path.
 //!
-//! Two channel implementations are available:
-//! - RefChannel: Thread-based with mutex (for traditional threading model)
-//! - CoroRefChannel: Coroutine-based using zig-aio (for async model)
+//! The RefChannel uses a Vyukov bounded MPSC queue with per-slot sequence
+//! numbers. Multiple producer threads (broadcasting interfaces) can push
+//! concurrently without locks. The single consumer thread (the listener)
+//! pops without contention.
 
 const std = @import("std");
 const pcap = @import("pcap.zig");
@@ -50,9 +51,8 @@ pub const PacketRing = struct {
 
     /// Store packet data and return the slot index.
     /// Thread-safe via atomic increment. The non-atomic memcpy/length writes
-    /// are ordered by the mutex release in RefChannel.send() -- the POSIX
-    /// mutex guarantees all prior writes are visible after the consumer's
-    /// mutex acquire in RefChannel.receive().
+    /// are ordered by the sequence store (release) in MpscRefQueue.push(),
+    /// which the consumer observes via sequence load (acquire) in pop().
     pub fn store(self: *PacketRing, data: []const u8) u8 {
         const idx = self.write_idx.fetchAdd(1, .monotonic) % RING_SIZE;
         const len: u16 = @intCast(@min(data.len, MAX_PACKET_SIZE));
@@ -81,108 +81,125 @@ pub const PacketRef = struct {
     timestamp_usec: i64,
 };
 
-/// Simple ring buffer for packet references (32 bytes each vs 9KB)
-const RefQueue = struct {
-    const QUEUE_SIZE = 256;
+/// Lock-free bounded MPSC queue for packet references.
+/// Based on Dmitry Vyukov's bounded MPSC queue with per-slot sequence numbers.
+/// Multiple producers can push concurrently via CAS on write_pos.
+/// Single consumer pops sequentially without contention.
+pub const MpscRefQueue = struct {
+    pub const QUEUE_SIZE = 256;
+    const MASK = QUEUE_SIZE - 1;
 
     items: [QUEUE_SIZE]PacketRef,
-    read_pos: usize,
-    write_pos: usize,
-    count: usize,
+    sequence: [QUEUE_SIZE]std.atomic.Value(u32),
+    write_pos: std.atomic.Value(u32),
+    read_pos: u32, // only consumer touches this
 
-    fn init() RefQueue {
-        return RefQueue{
-            .items = undefined,
-            .read_pos = 0,
-            .write_pos = 0,
-            .count = 0,
-        };
+    pub fn init() MpscRefQueue {
+        var self: MpscRefQueue = undefined;
+        self.write_pos = std.atomic.Value(u32).init(0);
+        self.read_pos = 0;
+        for (0..QUEUE_SIZE) |i| {
+            self.sequence[i] = std.atomic.Value(u32).init(@intCast(i));
+        }
+        return self;
     }
 
-    fn push(self: *RefQueue, item: PacketRef) bool {
-        if (self.count >= QUEUE_SIZE) {
-            return false; // Queue full
+    /// Push a ref into the queue. Lock-free, safe from multiple producers.
+    /// Returns false if the queue is full.
+    pub fn push(self: *MpscRefQueue, item: PacketRef) bool {
+        var pos = self.write_pos.load(.monotonic);
+        while (true) {
+            const slot = pos & MASK;
+            const seq = self.sequence[slot].load(.acquire);
+            const diff = @as(i64, seq) - @as(i64, pos);
+            if (diff == 0) {
+                // Slot available -- try to claim it
+                if (self.write_pos.cmpxchgWeak(pos, pos +% 1, .monotonic, .monotonic)) |updated| {
+                    pos = updated; // Lost race, retry with new pos
+                } else {
+                    // Claimed. Write data, then mark slot as filled.
+                    self.items[slot] = item;
+                    self.sequence[slot].store(pos +% 1, .release);
+                    return true;
+                }
+            } else if (diff < 0) {
+                return false; // Queue full
+            } else {
+                // Slot was reclaimed by consumer while we were looking.
+                pos = self.write_pos.load(.monotonic);
+            }
         }
-        self.items[self.write_pos] = item;
-        self.write_pos = (self.write_pos + 1) % QUEUE_SIZE;
-        self.count += 1;
-        return true;
     }
 
-    fn pop(self: *RefQueue) ?PacketRef {
-        if (self.count == 0) {
-            return null;
-        }
-        const item = self.items[self.read_pos];
-        self.read_pos = (self.read_pos + 1) % QUEUE_SIZE;
-        self.count -= 1;
+    /// Pop a ref from the queue. Only safe from a single consumer.
+    /// Returns null if empty.
+    pub fn pop(self: *MpscRefQueue) ?PacketRef {
+        const slot = self.read_pos & MASK;
+        const seq = self.sequence[slot].load(.acquire);
+        const expected = self.read_pos +% 1;
+        if (seq != expected) return null; // Empty or not yet committed
+        const item = self.items[slot];
+        self.sequence[slot].store(self.read_pos +% QUEUE_SIZE, .release);
+        self.read_pos +%= 1;
         return item;
+    }
+
+    /// Check if queue appears empty (non-authoritative, for spin loops).
+    pub fn isEmpty(self: *const MpscRefQueue) bool {
+        const slot = self.read_pos & MASK;
+        const seq = self.sequence[slot].load(.monotonic);
+        return seq != self.read_pos +% 1;
     }
 };
 
-/// Channel for receiving packet references (zero-copy)
+/// Lock-free channel for receiving packet references.
+/// Uses MpscRefQueue internally -- no mutexes in the hot path.
+/// Blocking receive uses spin + nanosleep hybrid for the send-only case.
 pub const RefChannel = struct {
-    queue: RefQueue,
-    mutex: std.Io.Mutex,
-    cond: std.Io.Condition,
-    closed: bool,
+    queue: MpscRefQueue,
+    closed: std.atomic.Value(bool),
 
     pub fn init() RefChannel {
         return RefChannel{
-            .queue = RefQueue.init(),
-            .mutex = std.Io.Mutex.init,
-            .cond = std.Io.Condition.init,
-            .closed = false,
+            .queue = MpscRefQueue.init(),
+            .closed = std.atomic.Value(bool).init(false),
         };
     }
 
-    pub fn deinit(_: *RefChannel) void {
-        // Nothing to free
-    }
+    pub fn deinit(_: *RefChannel) void {}
 
-    /// Send a packet ref to this channel
+    /// Send a packet ref. Lock-free, safe from multiple producer threads.
     pub fn send(self: *RefChannel, ref: PacketRef) !void {
-        self.mutex.lockUncancelable(undefined);
-        defer self.mutex.unlock(undefined);
-
-        if (self.closed) return error.ChannelClosed;
-
-        if (!self.queue.push(ref)) {
-            return error.QueueFull;
-        }
-        self.cond.signal(undefined);
+        if (self.closed.load(.acquire)) return error.ChannelClosed;
+        if (!self.queue.push(ref)) return error.QueueFull;
     }
 
-    /// Receive a packet ref from this channel (blocking)
+    /// Receive a packet ref (blocking). Spins briefly, then falls back to
+    /// 100us nanosleep polling. Used only by send-only/loopback listeners.
     pub fn receive(self: *RefChannel) ?PacketRef {
-        self.mutex.lockUncancelable(undefined);
-        defer self.mutex.unlock(undefined);
-
-        while (self.queue.count == 0 and !self.closed) {
-            self.cond.waitUncancelable(undefined, &self.mutex);
+        var spin: u32 = 0;
+        while (true) {
+            if (self.queue.pop()) |item| return item;
+            if (self.closed.load(.acquire)) return self.queue.pop(); // drain
+            if (spin < 128) {
+                std.atomic.spinLoopHint();
+                spin += 1;
+            } else {
+                const req = std.c.timespec{ .sec = 0, .nsec = 100_000 }; // 100us
+                _ = std.c.nanosleep(&req, null);
+                spin = 0;
+            }
         }
-
-        if (self.closed and self.queue.count == 0) {
-            return null;
-        }
-
-        return self.queue.pop();
     }
 
-    /// Try to receive without blocking
+    /// Try to receive without blocking. Lock-free.
     pub fn tryReceive(self: *RefChannel) ?PacketRef {
-        self.mutex.lockUncancelable(undefined);
-        defer self.mutex.unlock(undefined);
-
         return self.queue.pop();
     }
 
-    /// Close the channel
+    /// Close the channel. The consumer will drain remaining items.
     pub fn close(self: *RefChannel) void {
-        self.mutex.lockUncancelable(undefined);
-        defer self.mutex.unlock(undefined);
-        self.closed = true;
-        self.cond.broadcast(undefined);
+        self.closed.store(true, .release);
     }
 };
 
@@ -452,4 +469,283 @@ test "OutgoingPool round-robin" {
 
     // Should be different buffers
     try std.testing.expect(buf1 != buf2);
+}
+
+// ============================================================================
+// MpscRefQueue Tests
+// ============================================================================
+
+fn makeRef(idx: u8) PacketRef {
+    return PacketRef{
+        .ring_idx = idx,
+        .link_type = .ethernet,
+        .src_interface = "test",
+        .timestamp_sec = 0,
+        .timestamp_usec = 0,
+    };
+}
+
+test "MpscRefQueue: single-threaded push and pop" {
+    var q = MpscRefQueue.init();
+
+    try std.testing.expect(q.pop() == null); // empty
+
+    try std.testing.expect(q.push(makeRef(1)));
+    try std.testing.expect(q.push(makeRef(2)));
+    try std.testing.expect(q.push(makeRef(3)));
+
+    try std.testing.expectEqual(@as(u8, 1), q.pop().?.ring_idx);
+    try std.testing.expectEqual(@as(u8, 2), q.pop().?.ring_idx);
+    try std.testing.expectEqual(@as(u8, 3), q.pop().?.ring_idx);
+    try std.testing.expect(q.pop() == null); // drained
+}
+
+test "MpscRefQueue: fill to capacity" {
+    var q = MpscRefQueue.init();
+
+    // Fill all slots
+    for (0..MpscRefQueue.QUEUE_SIZE) |i| {
+        try std.testing.expect(q.push(makeRef(@intCast(i & 0xFF))));
+    }
+
+    // Next push should fail (queue full)
+    try std.testing.expect(!q.push(makeRef(0)));
+
+    // Pop one, then push should succeed again
+    _ = q.pop();
+    try std.testing.expect(q.push(makeRef(42)));
+}
+
+test "MpscRefQueue: wrap-around correctness" {
+    var q = MpscRefQueue.init();
+
+    // Push and pop past the wrap boundary
+    for (0..MpscRefQueue.QUEUE_SIZE * 3) |i| {
+        try std.testing.expect(q.push(makeRef(@intCast(i & 0xFF))));
+        const ref = q.pop().?;
+        try std.testing.expectEqual(@as(u8, @intCast(i & 0xFF)), ref.ring_idx);
+    }
+
+    try std.testing.expect(q.isEmpty());
+}
+
+test "MpscRefQueue: isEmpty reflects state" {
+    var q = MpscRefQueue.init();
+    try std.testing.expect(q.isEmpty());
+
+    try std.testing.expect(q.push(makeRef(1)));
+    try std.testing.expect(!q.isEmpty());
+
+    _ = q.pop();
+    try std.testing.expect(q.isEmpty());
+}
+
+test "MpscRefQueue: MPSC stress test" {
+    // 4 producer threads, 1 consumer (this thread)
+    const NUM_PRODUCERS = 4;
+    const ITEMS_PER_PRODUCER = 10_000;
+
+    var q = MpscRefQueue.init();
+    var produced = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(0)} ** NUM_PRODUCERS;
+
+    const ProducerCtx = struct {
+        queue: *MpscRefQueue,
+        id: u8,
+        produced: *std.atomic.Value(u32),
+
+        fn run(ctx: @This()) void {
+            var i: u32 = 0;
+            while (i < ITEMS_PER_PRODUCER) {
+                if (ctx.queue.push(makeRef(ctx.id))) {
+                    i += 1;
+                } else {
+                    // Queue full, spin
+                    std.atomic.spinLoopHint();
+                }
+            }
+            ctx.produced.store(i, .release);
+        }
+    };
+
+    // Spawn producers
+    var threads: [NUM_PRODUCERS]std.Thread = undefined;
+    for (0..NUM_PRODUCERS) |i| {
+        threads[i] = try std.Thread.spawn(.{}, ProducerCtx.run, .{ProducerCtx{
+            .queue = &q,
+            .id = @intCast(i),
+            .produced = &produced[i],
+        }});
+    }
+
+    // Consumer: count items per producer
+    var counts = [_]u32{0} ** NUM_PRODUCERS;
+    var total: u32 = 0;
+    const expected_total = NUM_PRODUCERS * ITEMS_PER_PRODUCER;
+
+    while (total < expected_total) {
+        if (q.pop()) |ref| {
+            counts[ref.ring_idx] += 1;
+            total += 1;
+        } else {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    // Join producers
+    for (&threads) |*t| t.join();
+
+    // Verify: each producer sent exactly ITEMS_PER_PRODUCER
+    for (counts) |c| {
+        try std.testing.expectEqual(@as(u32, ITEMS_PER_PRODUCER), c);
+    }
+    try std.testing.expect(q.isEmpty());
+}
+
+// ============================================================================
+// RefChannel Tests
+// ============================================================================
+
+test "RefChannel: send and tryReceive" {
+    var ch = RefChannel.init();
+    defer ch.deinit();
+
+    try ch.send(makeRef(10));
+    try ch.send(makeRef(20));
+
+    try std.testing.expectEqual(@as(u8, 10), ch.tryReceive().?.ring_idx);
+    try std.testing.expectEqual(@as(u8, 20), ch.tryReceive().?.ring_idx);
+    try std.testing.expect(ch.tryReceive() == null);
+}
+
+test "RefChannel: send after close returns error" {
+    var ch = RefChannel.init();
+    defer ch.deinit();
+
+    ch.close();
+    try std.testing.expectError(error.ChannelClosed, ch.send(makeRef(1)));
+}
+
+test "RefChannel: receive drains on close" {
+    var ch = RefChannel.init();
+    defer ch.deinit();
+
+    try ch.send(makeRef(42));
+    ch.close();
+
+    // Should still get the queued item
+    const ref = ch.receive();
+    try std.testing.expect(ref != null);
+    try std.testing.expectEqual(@as(u8, 42), ref.?.ring_idx);
+
+    // Now should get null (closed + empty)
+    try std.testing.expect(ch.receive() == null);
+}
+
+test "RefChannel: MPSC concurrent send + tryReceive" {
+    const NUM_SENDERS = 4;
+    const ITEMS_PER_SENDER = 5_000;
+
+    var ch = RefChannel.init();
+    defer ch.deinit();
+
+    const SenderCtx = struct {
+        channel: *RefChannel,
+        id: u8,
+
+        fn run(ctx: @This()) void {
+            var i: u32 = 0;
+            while (i < ITEMS_PER_SENDER) {
+                ctx.channel.send(makeRef(ctx.id)) catch {
+                    std.atomic.spinLoopHint();
+                    continue;
+                };
+                i += 1;
+            }
+        }
+    };
+
+    var threads: [NUM_SENDERS]std.Thread = undefined;
+    for (0..NUM_SENDERS) |i| {
+        threads[i] = try std.Thread.spawn(.{}, SenderCtx.run, .{SenderCtx{
+            .channel = &ch,
+            .id = @intCast(i),
+        }});
+    }
+
+    var counts = [_]u32{0} ** NUM_SENDERS;
+    var total: u32 = 0;
+    const expected = NUM_SENDERS * ITEMS_PER_SENDER;
+
+    while (total < expected) {
+        if (ch.tryReceive()) |ref| {
+            counts[ref.ring_idx] += 1;
+            total += 1;
+        } else {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    for (&threads) |*t| t.join();
+
+    for (counts) |c| {
+        try std.testing.expectEqual(@as(u32, ITEMS_PER_SENDER), c);
+    }
+}
+
+// ============================================================================
+// SendPktFeed Tripwire Tests
+// ============================================================================
+
+test "SendPktFeed: init and deinit with leak detection" {
+    const allocator = std.testing.allocator;
+    var feed = try SendPktFeed.init(allocator);
+    defer feed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), feed.count());
+}
+
+test "SendPktFeed: register multiple senders" {
+    const allocator = std.testing.allocator;
+    var feed = try SendPktFeed.init(allocator);
+    defer feed.deinit();
+
+    _ = try feed.registerSender("eth0");
+    _ = try feed.registerSender("eth1");
+    _ = try feed.registerSender("wg0");
+
+    try std.testing.expectEqual(@as(usize, 3), feed.count());
+}
+
+test "SendPktFeed: broadcast skips source interface" {
+    const allocator = std.testing.allocator;
+    var feed = try SendPktFeed.init(allocator);
+    defer feed.deinit();
+
+    const ch_a = try feed.registerSender("eth0");
+    const ch_b = try feed.registerSender("eth1");
+
+    // Broadcast from eth0 -- should only go to eth1
+    feed.broadcast("hello", "eth0", .ethernet, 0, 0);
+
+    try std.testing.expect(ch_a.tryReceive() == null); // skipped
+    try std.testing.expect(ch_b.tryReceive() != null); // received
+}
+
+test "SendPktFeed: allocation failure on init" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const result = SendPktFeed.init(failing.allocator());
+    try std.testing.expectError(error.OutOfMemory, result);
+}
+
+test "SendPktFeed: allocation failure on registerSender" {
+    // Use a FailingAllocator as the feed's allocator so registerSender hits OOM
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+
+    // init uses 1 allocation (the PacketRing), so fail_index=1 lets init succeed
+    // but the next allocation (in registerSender) will fail
+    var feed = try SendPktFeed.init(failing.allocator());
+    defer feed.deinit();
+
+    const result = feed.registerSender("eth0");
+    try std.testing.expectError(error.OutOfMemory, result);
 }
