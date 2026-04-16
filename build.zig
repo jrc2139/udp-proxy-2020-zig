@@ -17,7 +17,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
-    exe.linkSystemLibrary("pcap");
+    exe.root_module.linkSystemLibrary("pcap", .{});
 
     b.installArtifact(exe);
 
@@ -45,7 +45,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
-    tests.linkSystemLibrary("pcap");
+    tests.root_module.linkSystemLibrary("pcap", .{});
 
     const run_tests = b.addRunArtifact(tests);
 
@@ -64,7 +64,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
-    check_exe.linkSystemLibrary("pcap");
+    check_exe.root_module.linkSystemLibrary("pcap", .{});
 
     const check_step = b.step("check", "Check for compilation errors (used by ZLS)");
     check_step.dependOn(&check_exe.step);

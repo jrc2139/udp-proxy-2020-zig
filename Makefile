@@ -32,7 +32,7 @@ install: release
 # Build for FreeBSD
 # If already on FreeBSD, build natively. Otherwise error (cross-compile needs sysroot).
 freebsd:
-	# set path = ( /root/project/zig-x86_64-freebsd-0.15.2 $path )
+	# set path = ( /root/project/zig-x86_64-freebsd-0.16.0 $path )
 	zig build -Doptimize=ReleaseFast
 
 # Show help

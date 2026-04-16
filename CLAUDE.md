@@ -196,4 +196,4 @@ src/
 
 ## License
 
-MIT License (same as original udp-proxy-2020)
+Apache License 2.0

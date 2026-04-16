@@ -1,6 +1,7 @@
 //! Per-interface packet listener
 //!
 //! Handles packet capture, learning, and forwarding for a single interface.
+//! Supports both thread-based (run) and coroutine-based (runCoro) operation.
 
 const std = @import("std");
 const pcap = @import("pcap.zig");
@@ -8,8 +9,23 @@ const packet = @import("packet.zig");
 const bpf = @import("bpf.zig");
 const sender = @import("sender.zig");
 const ClientCache = @import("client_cache.zig").ClientCache;
+const c = @cImport({
+    @cInclude("sys/time.h");
+    @cInclude("sys/socket.h");
+    @cInclude("netinet/in.h");
+    @cInclude("unistd.h");
+    @cInclude("poll.h");
+});
 
 const log = std.log.scoped(.listener);
+
+/// Return milliseconds since Unix epoch using POSIX gettimeofday.
+/// Replaces milliTimestamp() which was removed in Zig 0.16.
+fn milliTimestamp() i64 {
+    var tv: c.struct_timeval = undefined;
+    _ = c.gettimeofday(&tv, null);
+    return @as(i64, tv.tv_sec) * 1000 + @divTrunc(tv.tv_usec, 1000);
+}
 
 // ============================================================================
 // Types
@@ -52,9 +68,9 @@ pub const Listener = struct {
     broadcast_ip: ?[4]u8,
     /// Client cache (for promisc interfaces)
     client_cache: ClientCache,
-    /// Ref channel for receiving packet refs to forward (zero-copy)
+    /// Ref channel for receiving packet refs to forward (zero-copy, thread mode)
     ref_channel: ?*sender.RefChannel,
-    /// Reference to the SendPktFeed for accessing packet data
+    /// Reference to the SendPktFeed for accessing packet data (thread mode)
     feed: ?*sender.SendPktFeed,
     /// Pre-allocated buffer pool for outgoing packets
     outgoing_pool: sender.OutgoingPool,
@@ -215,18 +231,18 @@ pub const Listener = struct {
         }
     }
 
-    /// Register with the send feed
+    /// Register with the send feed (thread mode)
     pub fn registerSender(self: *Listener, feed: *sender.SendPktFeed) !void {
         self.ref_channel = try feed.registerSender(self.config.iface_name);
         self.feed = feed;
     }
 
-    /// Main packet handling loop (zero-copy version)
+    /// Main packet handling loop (zero-copy version, thread mode)
     pub fn run(self: *Listener, feed: *sender.SendPktFeed) void {
         self.running = true;
 
         // Cleanup timer (every 30 seconds - less aggressive than before)
-        var last_cleanup = std.time.milliTimestamp();
+        var last_cleanup = milliTimestamp();
         const cleanup_interval: i64 = 30000;
 
         log.debug("{s}: starting packet handler (send_only={})", .{ self.config.iface_name, self.config.send_only });
@@ -274,7 +290,7 @@ pub const Listener = struct {
             }
 
             // Periodic cleanup (less frequent, lazy expiration handles most cases)
-            const now = std.time.milliTimestamp();
+            const now = milliTimestamp();
             if (now - last_cleanup > cleanup_interval) {
                 self.client_cache.cleanup();
                 last_cleanup = now;
@@ -430,83 +446,79 @@ pub const Listener = struct {
     }
 };
 
-/// UDP sink - listens on UDP ports to prevent ICMP Port Unreachable
+/// UDP sink - binds UDP ports to absorb traffic and prevent ICMP Port Unreachable.
+/// Uses a single poll thread for all sockets instead of thread-per-socket.
 pub const UdpSink = struct {
-    sockets: std.ArrayListUnmanaged(std.posix.socket_t),
+    sockets: std.ArrayListUnmanaged(c_int),
     allocator: std.mem.Allocator,
-    threads: std.ArrayListUnmanaged(std.Thread),
+    thread: ?std.Thread,
 
     pub fn init(allocator: std.mem.Allocator) UdpSink {
         return UdpSink{
-            .sockets = .{},
+            .sockets = .empty,
             .allocator = allocator,
-            .threads = .{},
+            .thread = null,
         };
     }
 
     pub fn deinit(self: *UdpSink) void {
-        // Close all sockets
+        // Close all sockets -- causes poll() to return in the sink thread
         for (self.sockets.items) |sock| {
-            std.posix.close(sock);
+            _ = c.close(sock);
         }
-        self.sockets.deinit(self.allocator);
-
-        // Wait for threads
-        for (self.threads.items) |thread| {
+        if (self.thread) |thread| {
             thread.join();
         }
-        self.threads.deinit(self.allocator);
+        self.sockets.deinit(self.allocator);
     }
 
     /// Bind to the specified port on the given interface address
     pub fn bind(self: *UdpSink, ip: [4]u8, port: u16) !void {
-        const sock = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
-        errdefer std.posix.close(sock);
+        const sock = c.socket(c.AF_INET, c.SOCK_DGRAM, 0);
+        if (sock < 0) return error.SocketCreationFailed;
+        errdefer _ = c.close(sock);
 
-        const addr = std.net.Address.initIp4(ip, port);
+        // Allow quick restart without EADDRINUSE
+        const enable: c_int = 1;
+        _ = c.setsockopt(sock, c.SOL_SOCKET, c.SO_REUSEADDR, @ptrCast(&enable), @sizeOf(c_int));
 
-        std.posix.bind(sock, &addr.any, addr.getOsSockLen()) catch |err| {
-            log.warn("Failed to bind to {d}.{d}.{d}.{d}:{d}: {}", .{
-                ip[0],
-                ip[1],
-                ip[2],
-                ip[3],
-                port,
-                err,
-            });
-            return err;
-        };
+        var addr: c.struct_sockaddr_in = std.mem.zeroes(c.struct_sockaddr_in);
+        addr.sin_family = c.AF_INET;
+        addr.sin_port = std.mem.nativeToBig(u16, port);
+        addr.sin_addr.s_addr = @bitCast(ip);
+
+        if (c.bind(sock, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_in)) < 0) {
+            log.warn("Failed to bind to {d}.{d}.{d}.{d}:{d}", .{ ip[0], ip[1], ip[2], ip[3], port });
+            return error.BindFailed;
+        }
 
         try self.sockets.append(self.allocator, sock);
-
-        // Start sink thread
-        const thread = try std.Thread.spawn(.{}, sinkThread, .{sock});
-        try self.threads.append(self.allocator, thread);
-
-        log.debug("UDP sink bound to {d}.{d}.{d}.{d}:{d}", .{
-            ip[0],
-            ip[1],
-            ip[2],
-            ip[3],
-            port,
-        });
+        log.debug("UDP sink bound to {d}.{d}.{d}.{d}:{d}", .{ ip[0], ip[1], ip[2], ip[3], port });
     }
 
-    fn sinkThread(sock: std.posix.socket_t) void {
-        var buf: [8192]u8 = undefined;
+    /// Start the single poll thread after all sockets are bound
+    pub fn start(self: *UdpSink) !void {
+        if (self.sockets.items.len == 0) return;
+        self.thread = try std.Thread.spawn(.{}, sinkPollThread, .{self.sockets.items});
+    }
 
+    fn sinkPollThread(sockets: []const c_int) void {
+        var pfds: [64]c.struct_pollfd = undefined;
+        const n = @min(sockets.len, pfds.len);
+        for (sockets[0..n], 0..n) |sock, i| {
+            pfds[i] = .{ .fd = sock, .events = c.POLLIN, .revents = 0 };
+        }
+
+        var buf: [8192]u8 = undefined;
         while (true) {
-            _ = std.posix.recvfrom(sock, &buf, 0, null, null) catch |err| {
-                if (err == error.ConnectionResetByPeer or
-                    err == error.SocketNotConnected)
-                {
-                    // Expected errors, continue
-                    continue;
+            const ret = c.poll(&pfds, @intCast(n), -1);
+            if (ret < 0) break; // sockets closed, exit
+            for (pfds[0..n]) |*pfd| {
+                if (pfd.revents & c.POLLIN != 0) {
+                    _ = c.recvfrom(pfd.fd, &buf, buf.len, 0, null, null);
                 }
-                // Socket likely closed, exit
-                break;
-            };
-            // Discard the data
+                if (pfd.revents & c.POLLNVAL != 0) return; // fd closed
+            }
         }
     }
 };
