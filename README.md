@@ -19,15 +19,15 @@ libpcap is included in the base system:
 
 ```bash
 # Install Zig (if not already installed)
-fetch https://ziglang.org/download/0.15.2/zig-x86_64-freebsd-0.15.2.tar.xz
-tar xf zig-x86_64-freebsd-0.15.2.tar.xz
+fetch https://ziglang.org/download/0.16.0/zig-x86_64-freebsd-0.16.0.tar.xz
+tar xf zig-x86_64-freebsd-0.16.0.tar.xz
 
 # Add to PATH (use sh, not csh/tcsh)
 sh
-export PATH=$PATH:$(pwd)/zig-x86_64-freebsd-0.15.2
+export PATH=$PATH:$(pwd)/zig-x86_64-freebsd-0.16.0
 
 # Or if using csh/tcsh (default on pfSense):
-# setenv PATH $PATH:$PWD/zig-x86_64-freebsd-0.15.2
+# setenv PATH $PATH:$PWD/zig-x86_64-freebsd-0.16.0
 
 # Build (using make or zig directly)
 make
