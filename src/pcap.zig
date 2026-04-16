@@ -291,6 +291,31 @@ pub const Handle = struct {
         return self.link_type;
     }
 
+    /// Get the selectable file descriptor for async I/O polling.
+    /// Returns null if the platform doesn't support selectable fds (Windows).
+    /// This fd can be used with poll/select/epoll to wait for packets.
+    pub fn getSelectableFd(self: *Handle) ?std.posix.fd_t {
+        if (!self.activated) return null;
+
+        const fd = c.pcap_get_selectable_fd(self.handle);
+        if (fd == -1) {
+            return null;
+        }
+        return fd;
+    }
+
+    /// Set non-blocking mode on the pcap handle.
+    /// When enabled, nextPacket() returns immediately if no packet is available.
+    pub fn setNonBlock(self: *Handle, nonblock: bool) Error!void {
+        if (!self.activated) return Error.NotActivated;
+
+        var errbuf: [c.PCAP_ERRBUF_SIZE]u8 = undefined;
+        if (c.pcap_setnonblock(self.handle, if (nonblock) 1 else 0, &errbuf) < 0) {
+            log.err("pcap_setnonblock failed: {s}", .{std.mem.sliceTo(&errbuf, 0)});
+            return Error.CaptureError;
+        }
+    }
+
     /// Close the handle
     pub fn close(self: *Handle) void {
         c.pcap_close(self.handle);

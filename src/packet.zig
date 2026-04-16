@@ -59,12 +59,12 @@ pub const EthernetHeader = extern struct {
         self.ether_type = std.mem.nativeToBig(u16, @intFromEnum(etype));
     }
 
-    pub fn format(self: *const EthernetHeader, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+    pub fn format(self: *const EthernetHeader, comptime _: []const u8, _: std.fmt.Options, writer: anytype) !void {
         try writer.print("Eth[{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2} -> {x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2} type=0x{x:0>4}]", .{
-            self.src_mac[0], self.src_mac[1], self.src_mac[2],
-            self.src_mac[3], self.src_mac[4], self.src_mac[5],
-            self.dst_mac[0], self.dst_mac[1], self.dst_mac[2],
-            self.dst_mac[3], self.dst_mac[4], self.dst_mac[5],
+            self.src_mac[0],                           self.src_mac[1], self.src_mac[2],
+            self.src_mac[3],                           self.src_mac[4], self.src_mac[5],
+            self.dst_mac[0],                           self.dst_mac[1], self.dst_mac[2],
+            self.dst_mac[3],                           self.dst_mac[4], self.dst_mac[5],
             std.mem.bigToNative(u16, self.ether_type),
         });
     }
@@ -133,12 +133,11 @@ pub const IPv4Header = extern struct {
         self.checksum = std.mem.nativeToBig(u16, csum);
     }
 
-    pub fn format(self: *const IPv4Header, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+    pub fn format(self: *const IPv4Header, comptime _: []const u8, _: std.fmt.Options, writer: anytype) !void {
         try writer.print("IPv4[{d}.{d}.{d}.{d} -> {d}.{d}.{d}.{d} proto={d} len={d}]", .{
-            self.src_ip[0], self.src_ip[1], self.src_ip[2], self.src_ip[3],
-            self.dst_ip[0], self.dst_ip[1], self.dst_ip[2], self.dst_ip[3],
-            self.protocol,
-            self.getTotalLength(),
+            self.src_ip[0], self.src_ip[1],        self.src_ip[2], self.src_ip[3],
+            self.dst_ip[0], self.dst_ip[1],        self.dst_ip[2], self.dst_ip[3],
+            self.protocol,  self.getTotalLength(),
         });
     }
 };
@@ -174,7 +173,7 @@ pub const UdpHeader = extern struct {
         self.length = std.mem.nativeToBig(u16, len);
     }
 
-    pub fn format(self: *const UdpHeader, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+    pub fn format(self: *const UdpHeader, comptime _: []const u8, _: std.fmt.Options, writer: anytype) !void {
         try writer.print("UDP[{d} -> {d} len={d}]", .{
             self.getSrcPort(),
             self.getDstPort(),

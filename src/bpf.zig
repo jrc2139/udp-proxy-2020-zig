@@ -26,27 +26,26 @@ pub fn buildFilter(
         return error.NoPortsSpecified;
     }
 
-    var buf = std.ArrayListUnmanaged(u8){};
+    var buf = std.ArrayListUnmanaged(u8).empty;
     defer buf.deinit(allocator);
-    const writer = buf.writer(allocator);
 
     // Build port filter: "udp port X or udp port Y"
     if (ports.len == 1) {
-        try writer.print("udp port {d}", .{ports[0]});
+        try buf.print(allocator, "udp port {d}", .{ports[0]});
     } else {
-        try writer.writeByte('(');
+        try buf.append(allocator, '(');
         for (ports, 0..) |port, i| {
             if (i > 0) {
-                try writer.writeAll(" or ");
+                try buf.appendSlice(allocator, " or ");
             }
-            try writer.print("udp port {d}", .{port});
+            try buf.print(allocator, "udp port {d}", .{port});
         }
-        try writer.writeByte(')');
+        try buf.append(allocator, ')');
     }
 
     // Build source network filter to avoid loops
     // This filters to only accept traffic from the local networks
-    var networks = std.ArrayListUnmanaged(NetworkCIDR){};
+    var networks = std.ArrayListUnmanaged(NetworkCIDR).empty;
     defer networks.deinit(allocator);
 
     for (addresses) |addr| {
@@ -70,11 +69,11 @@ pub fn buildFilter(
 
     // Add network filter if we have valid networks
     if (networks.items.len > 0) {
-        try writer.writeAll(" and ");
+        try buf.appendSlice(allocator, " and ");
 
         if (networks.items.len == 1) {
             const net = networks.items[0];
-            try writer.print("src net {d}.{d}.{d}.{d}/{d}", .{
+            try buf.print(allocator, "src net {d}.{d}.{d}.{d}/{d}", .{
                 net.addr[0],
                 net.addr[1],
                 net.addr[2],
@@ -82,12 +81,12 @@ pub fn buildFilter(
                 net.prefix,
             });
         } else {
-            try writer.writeByte('(');
+            try buf.append(allocator, '(');
             for (networks.items, 0..) |net, i| {
                 if (i > 0) {
-                    try writer.writeAll(" or ");
+                    try buf.appendSlice(allocator, " or ");
                 }
-                try writer.print("src net {d}.{d}.{d}.{d}/{d}", .{
+                try buf.print(allocator, "src net {d}.{d}.{d}.{d}/{d}", .{
                     net.addr[0],
                     net.addr[1],
                     net.addr[2],
@@ -95,7 +94,7 @@ pub fn buildFilter(
                     net.prefix,
                 });
             }
-            try writer.writeByte(')');
+            try buf.append(allocator, ')');
         }
     }
 
@@ -120,21 +119,20 @@ pub fn buildPortFilter(allocator: std.mem.Allocator, ports: []const u16) ![:0]u8
         return error.NoPortsSpecified;
     }
 
-    var buf = std.ArrayListUnmanaged(u8){};
+    var buf = std.ArrayListUnmanaged(u8).empty;
     defer buf.deinit(allocator);
-    const writer = buf.writer(allocator);
 
     if (ports.len == 1) {
-        try writer.print("udp port {d}", .{ports[0]});
+        try buf.print(allocator, "udp port {d}", .{ports[0]});
     } else {
-        try writer.writeByte('(');
+        try buf.append(allocator, '(');
         for (ports, 0..) |port, i| {
             if (i > 0) {
-                try writer.writeAll(" or ");
+                try buf.appendSlice(allocator, " or ");
             }
-            try writer.print("udp port {d}", .{port});
+            try buf.print(allocator, "udp port {d}", .{port});
         }
-        try writer.writeByte(')');
+        try buf.append(allocator, ')');
     }
 
     const result = try allocator.allocSentinel(u8, buf.items.len, 0);
