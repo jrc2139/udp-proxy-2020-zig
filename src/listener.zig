@@ -153,9 +153,10 @@ pub const Listener = struct {
         var handle = try pcap.Handle.create(self.allocator, self.config.iface_name);
         errdefer handle.close();
 
-        // Configure
+        // Configure -- always enable promiscuous mode so pcap captures
+        // multicast packets (mDNS, SSDP) in addition to broadcast
         try handle.setSnaplen(9000);
-        try handle.setPromisc(self.config.promisc);
+        try handle.setPromisc(true);
         try handle.setTimeout(self.config.timeout_ms);
 
         // Activate

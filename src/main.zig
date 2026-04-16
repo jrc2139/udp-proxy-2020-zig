@@ -293,12 +293,12 @@ fn runWithThreads(
             }
         }
 
-        // Determine if this interface needs promiscuous mode
-        // (interfaces without broadcast support, like tun/wireguard)
-        var promisc = false;
+        // Determine if this is a point-to-point interface (no broadcast support)
+        // Point-to-point interfaces use per-client forwarding via the client cache.
+        // Broadcast interfaces forward to the subnet broadcast address.
+        var is_p2p = false;
         for (interfaces) |iface| {
             if (std.mem.eql(u8, iface.name, iface_name[0..iface_name.len])) {
-                // If no broadcast address in any address, use promisc
                 var has_broadcast = false;
                 for (iface.addresses) |addr| {
                     if (addr.broadcast != null) {
@@ -306,7 +306,7 @@ fn runWithThreads(
                         break;
                     }
                 }
-                promisc = !has_broadcast;
+                is_p2p = !has_broadcast;
                 break;
             }
         }
@@ -327,7 +327,7 @@ fn runWithThreads(
             .timeout_ms = args.timeout_ms,
             .cache_ttl_minutes = args.cache_ttl,
             .fixed_ips = try allocator.dupe([4]u8, fixed_ips.items),
-            .promisc = promisc,
+            .promisc = is_p2p,
             .send_only = false,
             .pcap_debug = args.pcap_debug,
             .pcap_path = args.pcap_path,
