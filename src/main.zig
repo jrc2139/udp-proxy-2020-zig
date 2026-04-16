@@ -7,12 +7,6 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const c = @cImport({
-    @cInclude("fcntl.h");
-    @cInclude("unistd.h");
-    @cInclude("time.h");
-    @cInclude("sys/time.h");
-});
 
 const pcap = @import("pcap.zig");
 const packet = @import("packet.zig");
@@ -111,10 +105,10 @@ fn customLog(
 
     const scope_prefix = if (scope == .default) "" else "[" ++ @tagName(scope) ++ "] ";
 
-    // Get current timestamp via POSIX gettimeofday (std.time.timestamp removed in 0.16)
-    var tv: c.struct_timeval = undefined;
-    _ = c.gettimeofday(&tv, null);
-    const epoch_secs: u64 = @intCast(tv.tv_sec);
+    // Get current timestamp via POSIX clock_gettime (avoids @cImport of sys/time.h)
+    var ts: std.posix.timespec = undefined;
+    if (std.c.clock_gettime(.REALTIME, &ts) != 0) return;
+    const epoch_secs: u64 = @intCast(ts.sec);
     const epoch_day = std.time.epoch.EpochDay{ .day = @intCast(@divFloor(epoch_secs, std.time.s_per_day)) };
     const year_day = epoch_day.calculateYearDay();
     const month_day = year_day.calculateMonthDay();
@@ -142,39 +136,36 @@ fn customLog(
 
     // Write via POSIX fd to avoid requiring io (std.Io.File.write requires io)
     const fd: std.Io.File.Handle = if (log_file) |f| f.handle else std.Io.File.stderr().handle;
-    _ = c.write(fd, msg.ptr, msg.len);
+    _ = std.c.write(fd, msg.ptr, msg.len);
 }
 
 fn initLogFile(path: ?[]const u8) !void {
     const log_path = path orelse default_log_path;
-    // Open with O_WRONLY using POSIX open (std.fs.cwd().openFile requires io in 0.16)
     var path_buf: [512]u8 = undefined;
     const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{log_path}) catch return error.PathTooLong;
-    const fd = c.open(path_z.ptr, c.O_WRONLY, @as(c_int, 0o644));
+    const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0o644));
     if (fd < 0) return error.FileNotFound;
-    _ = c.lseek(fd, 0, c.SEEK_END);
+    _ = std.c.lseek(fd, 0, std.posix.SEEK.END);
     log_file = std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
 }
 
 fn initLogFileCreate(path: ?[]const u8) !void {
     const log_path = path orelse default_log_path;
-    // Create if doesn't exist, open for append using POSIX
     var path_buf: [512]u8 = undefined;
     const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{log_path}) catch return error.PathTooLong;
-    // Try open first; create if missing
-    var fd = c.open(path_z.ptr, c.O_WRONLY, @as(c_int, 0o644));
+    var fd = std.c.open(path_z.ptr, .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0o644));
     if (fd < 0) {
-        fd = c.open(path_z.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_int, 0o644));
+        fd = std.c.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
         if (fd < 0) return error.OpenFailed;
     } else {
-        _ = c.lseek(fd, 0, c.SEEK_END);
+        _ = std.c.lseek(fd, 0, std.posix.SEEK.END);
     }
     log_file = std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
 }
 
 fn deinitLogFile() void {
     if (log_file) |f| {
-        _ = c.close(f.handle);
+        _ = std.c.close(f.handle);
         log_file = null;
     }
 }
@@ -216,7 +207,7 @@ pub fn main(proc_init: std.process.Init.Minimal) !void {
             // Fall back to stderr if we can't open log file
             var err_buf: [256]u8 = undefined;
             const msg = std.fmt.bufPrint(&err_buf, "Warning: Could not open log file: {}\n", .{err}) catch "Warning: Could not open log file\n";
-            _ = c.write(std.Io.File.stderr().handle, msg.ptr, msg.len);
+            _ = std.c.write(std.Io.File.stderr().handle, msg.ptr, msg.len);
         };
     }
     defer deinitLogFile();
@@ -562,7 +553,7 @@ fn printHelp() void {
         \\
         \\
     ;
-    _ = c.write(std.Io.File.stdout().handle, help.ptr, help.len);
+    _ = std.c.write(std.Io.File.stdout().handle, help.ptr, help.len);
 }
 
 // ============================================================================

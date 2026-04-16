@@ -9,22 +9,14 @@ const packet = @import("packet.zig");
 const bpf = @import("bpf.zig");
 const sender = @import("sender.zig");
 const ClientCache = @import("client_cache.zig").ClientCache;
-const c = @cImport({
-    @cInclude("sys/time.h");
-    @cInclude("sys/socket.h");
-    @cInclude("netinet/in.h");
-    @cInclude("unistd.h");
-    @cInclude("poll.h");
-});
 
 const log = std.log.scoped(.listener);
 
-/// Return milliseconds since Unix epoch using POSIX gettimeofday.
-/// Replaces milliTimestamp() which was removed in Zig 0.16.
+/// Return milliseconds since Unix epoch using POSIX clock_gettime.
 fn milliTimestamp() i64 {
-    var tv: c.struct_timeval = undefined;
-    _ = c.gettimeofday(&tv, null);
-    return @as(i64, tv.tv_sec) * 1000 + @divTrunc(tv.tv_usec, 1000);
+    var ts: std.posix.timespec = undefined;
+    if (std.c.clock_gettime(.REALTIME, &ts) != 0) return 0;
+    return @as(i64, ts.sec) * 1000 + @divTrunc(ts.nsec, std.time.ns_per_ms);
 }
 
 // ============================================================================
@@ -464,7 +456,7 @@ pub const UdpSink = struct {
     pub fn deinit(self: *UdpSink) void {
         // Close all sockets -- causes poll() to return in the sink thread
         for (self.sockets.items) |sock| {
-            _ = c.close(sock);
+            _ = std.c.close(sock);
         }
         if (self.thread) |thread| {
             thread.join();
@@ -474,20 +466,20 @@ pub const UdpSink = struct {
 
     /// Bind to the specified port on the given interface address
     pub fn bind(self: *UdpSink, ip: [4]u8, port: u16) !void {
-        const sock = c.socket(c.AF_INET, c.SOCK_DGRAM, 0);
+        const sock = std.c.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
         if (sock < 0) return error.SocketCreationFailed;
-        errdefer _ = c.close(sock);
+        errdefer _ = std.c.close(sock);
 
         // Allow quick restart without EADDRINUSE
         const enable: c_int = 1;
-        _ = c.setsockopt(sock, c.SOL_SOCKET, c.SO_REUSEADDR, @ptrCast(&enable), @sizeOf(c_int));
+        _ = std.c.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, @ptrCast(&enable), @sizeOf(c_int));
 
-        var addr: c.struct_sockaddr_in = std.mem.zeroes(c.struct_sockaddr_in);
-        addr.sin_family = c.AF_INET;
-        addr.sin_port = std.mem.nativeToBig(u16, port);
-        addr.sin_addr.s_addr = @bitCast(ip);
+        var addr: std.posix.sockaddr.in = std.mem.zeroes(std.posix.sockaddr.in);
+        addr.family = std.posix.AF.INET;
+        addr.port = std.mem.nativeToBig(u16, port);
+        addr.addr = @bitCast(ip);
 
-        if (c.bind(sock, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_in)) < 0) {
+        if (std.c.bind(sock, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in)) < 0) {
             log.warn("Failed to bind to {d}.{d}.{d}.{d}:{d}", .{ ip[0], ip[1], ip[2], ip[3], port });
             return error.BindFailed;
         }
@@ -503,21 +495,20 @@ pub const UdpSink = struct {
     }
 
     fn sinkPollThread(sockets: []const c_int) void {
-        var pfds: [64]c.struct_pollfd = undefined;
+        var pfds: [64]std.posix.pollfd = undefined;
         const n = @min(sockets.len, pfds.len);
         for (sockets[0..n], 0..n) |sock, i| {
-            pfds[i] = .{ .fd = sock, .events = c.POLLIN, .revents = 0 };
+            pfds[i] = .{ .fd = sock, .events = std.posix.POLL.IN, .revents = 0 };
         }
 
         var buf: [8192]u8 = undefined;
         while (true) {
-            const ret = c.poll(&pfds, @intCast(n), -1);
-            if (ret < 0) break; // sockets closed, exit
+            _ = std.posix.poll(pfds[0..n], -1) catch break; // sockets closed, exit
             for (pfds[0..n]) |*pfd| {
-                if (pfd.revents & c.POLLIN != 0) {
-                    _ = c.recvfrom(pfd.fd, &buf, buf.len, 0, null, null);
+                if (pfd.revents & std.posix.POLL.IN != 0) {
+                    _ = std.c.recvfrom(pfd.fd, &buf, buf.len, 0, null, null);
                 }
-                if (pfd.revents & c.POLLNVAL != 0) return; // fd closed
+                if (pfd.revents & std.posix.POLL.NVAL != 0) return; // fd closed
             }
         }
     }
