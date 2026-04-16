@@ -86,8 +86,9 @@ extern "c" fn pcap_freealldevs(alldevs: ?*pcap_if_t) void;
 pub const LinkType = enum(c_int) {
     null = 0, // BSD loopback
     ethernet = 1, // Ethernet
-    loop = 108, // OpenBSD loopback
     raw = 101, // Raw IP (Linux cooked capture uses 113)
+    loop = 108, // OpenBSD loopback
+    enc = 109, // IPsec encapsulation (FreeBSD/OpenBSD enc0)
     linux_sll = 113, // Linux cooked capture
     _,
 
@@ -97,7 +98,7 @@ pub const LinkType = enum(c_int) {
 
     pub fn isSupported(self: LinkType) bool {
         return switch (self) {
-            .null, .ethernet, .loop, .raw => true,
+            .null, .ethernet, .loop, .raw, .enc => true,
             else => false,
         };
     }
@@ -108,6 +109,7 @@ pub const LinkType = enum(c_int) {
             .ethernet => "Ethernet",
             .loop => "OpenBSD Loopback",
             .raw => "Raw IP",
+            .enc => "IPsec ENC",
             .linux_sll => "Linux SLL",
             _ => "Unknown",
         };
