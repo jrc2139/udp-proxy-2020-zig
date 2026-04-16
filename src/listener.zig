@@ -134,12 +134,7 @@ pub const Listener = struct {
 
         const iface = found_iface.?;
 
-        if (iface.addresses.len == 0) {
-            log.err("Interface {s} has no configured addresses", .{self.config.iface_name});
-            return error.InterfaceNotConfigured;
-        }
-
-        // Calculate broadcast address for non-promisc interfaces
+        // Calculate broadcast address for non-p2p interfaces
         if (!self.config.promisc) {
             for (iface.addresses) |addr| {
                 if (addr.addr != null and addr.netmask != null) {
@@ -169,8 +164,11 @@ pub const Listener = struct {
             return error.UnsupportedLinkType;
         }
 
-        // Set BPF filter
-        const filter = try bpf.buildFilter(self.allocator, self.config.ports, iface.addresses);
+        // Set BPF filter -- use port-only filter for interfaces without addresses (e.g., enc0)
+        const filter = if (iface.addresses.len > 0)
+            try bpf.buildFilter(self.allocator, self.config.ports, iface.addresses)
+        else
+            try bpf.buildPortFilter(self.allocator, self.config.ports);
         defer self.allocator.free(filter);
 
         try handle.setFilter(filter);
