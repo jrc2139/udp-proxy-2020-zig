@@ -371,6 +371,7 @@ pub fn buildOutgoingPacketInto(
     const l2_size: usize = switch (dst_link_type) {
         .ethernet => packet.ETHERNET_HEADER_SIZE,
         .null, .loop => packet.LOOPBACK_HEADER_SIZE,
+        .enc => packet.ENC_HEADER_SIZE,
         .raw => 0,
         else => return error.UnsupportedLinkType,
     };
@@ -392,6 +393,10 @@ pub fn buildOutgoingPacketInto(
         },
         .null, .loop => {
             _ = try builder.addLoopback(.ipv4);
+        },
+        .enc => {
+            // ENC header: AF_INET (2), SPI (0), flags (0)
+            try builder.addEnc();
         },
         .raw => {
             // No L2 header

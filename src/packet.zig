@@ -16,6 +16,7 @@ pub const ETHERNET_HEADER_SIZE = 14;
 pub const IPV4_MIN_HEADER_SIZE = 20;
 pub const UDP_HEADER_SIZE = 8;
 pub const LOOPBACK_HEADER_SIZE = 4;
+pub const ENC_HEADER_SIZE = 12; // IPsec encapsulation: 4-byte AF + 4-byte SPI + 4-byte flags
 pub const MAX_PACKET_SIZE = 9000; // Jumbo frame support
 
 /// Ethernet type values
@@ -286,6 +287,19 @@ pub fn parsePacket(data: []const u8, link_type: pcap.LinkType) ParseError!Parsed
                 return ParseError.UnsupportedEtherType;
             }
         },
+        .enc => {
+            // IPsec ENC header: 4-byte AF + 4-byte SPI + 4-byte flags
+            if (data.len < ENC_HEADER_SIZE) {
+                return ParseError.PacketTooShort;
+            }
+
+            // First 4 bytes are AF (same as loopback)
+            const af = std.mem.readInt(u32, data[0..4], .little);
+            if (af != 2) { // AF_INET
+                return ParseError.UnsupportedEtherType;
+            }
+            offset = ENC_HEADER_SIZE;
+        },
         .raw => {
             // No L2 header, starts with IP
             offset = 0;
@@ -384,6 +398,22 @@ pub const PacketBuilder = struct {
 
         self.offset += LOOPBACK_HEADER_SIZE;
         return loop;
+    }
+
+    /// Add IPsec ENC header (12 bytes: AF_INET + SPI=0 + flags=0)
+    pub fn addEnc(self: *PacketBuilder) !void {
+        if (self.offset + ENC_HEADER_SIZE > self.buffer.len) {
+            return error.BufferTooSmall;
+        }
+
+        // AF_INET = 2 (little-endian, same as BSD loopback)
+        std.mem.writeInt(u32, self.buffer[self.offset..][0..4], 2, .little);
+        // SPI = 0
+        std.mem.writeInt(u32, self.buffer[self.offset + 4 ..][0..4], 0, .little);
+        // flags = 0
+        std.mem.writeInt(u32, self.buffer[self.offset + 8 ..][0..4], 0, .little);
+
+        self.offset += ENC_HEADER_SIZE;
     }
 
     /// Add IPv4 header (returns header for later checksum calculation)

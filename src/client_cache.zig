@@ -9,18 +9,14 @@
 //! that never invalidates in-flight iterations.
 
 const std = @import("std");
-const c = @cImport({
-    @cInclude("sys/time.h");
-});
 
 const log = std.log.scoped(.client_cache);
 
-/// Return milliseconds since Unix epoch using POSIX gettimeofday.
-/// Replaces milliTimestamp() which was removed in Zig 0.16.
+/// Return milliseconds since Unix epoch using POSIX clock_gettime.
 fn milliTimestamp() i64 {
-    var tv: c.struct_timeval = undefined;
-    _ = c.gettimeofday(&tv, null);
-    return @as(i64, tv.tv_sec) * 1000 + @divTrunc(tv.tv_usec, 1000);
+    var ts: std.posix.timespec = undefined;
+    if (std.c.clock_gettime(.REALTIME, &ts) != 0) return 0;
+    return @as(i64, ts.sec) * 1000 + @divTrunc(ts.nsec, std.time.ns_per_ms);
 }
 
 // ============================================================================
