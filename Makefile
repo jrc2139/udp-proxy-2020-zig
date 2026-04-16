@@ -33,11 +33,11 @@ install: release
 # If already on FreeBSD, build natively. Otherwise error (cross-compile needs sysroot).
 freebsd:
 	# set path = ( /root/project/zig-x86_64-freebsd-0.16.0 $path )
-	zig build -Doptimize=ReleaseFast
+	zig build -Doptimize=ReleaseFast -Dcpu=native
 
 # Show help
 help:
-	@echo "udp-proxy-2020 build targets:"
+	@echo "udp-proxy-2020-zig build targets:"
 	@echo "  make          - Build release (optimized)"
 	@echo "  make release  - Build release (optimized)"
 	@echo "  make debug    - Build debug"
