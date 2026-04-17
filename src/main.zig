@@ -21,8 +21,9 @@ const log = std.log.scoped(.@"udp-proxy");
 // Version Info
 // ============================================================================
 
-pub const version = "0.1.0";
-pub const build_info = "zig-port";
+const build_info_mod = @import("build_info");
+pub const version = build_info_mod.version;
+pub const build_info = build_info_mod.commit;
 
 // ============================================================================
 // CLI Arguments
