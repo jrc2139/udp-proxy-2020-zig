@@ -28,7 +28,7 @@ jobs:
             zig_target: aarch64-macos
             install: brew install libpcap
           - name: darwin-amd64
-            runner: macos-13
+            runner: macos-14
             zig_target: x86_64-macos
             install: brew install libpcap
     runs-on: ${{ matrix.runner }}
