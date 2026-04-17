@@ -41,7 +41,7 @@ zig build check
 ```
 
 ### Requirements
-- Zig 0.15.x (minimum 0.15.0)
+- Zig 0.16.x (minimum 0.15.0)
 - libpcap (`libpcap-dev` on Debian/Ubuntu, included in FreeBSD base)
 
 ## Architecture
