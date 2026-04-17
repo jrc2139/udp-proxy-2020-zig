@@ -1,0 +1,220 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  ZIG_VERSION: "0.16.0"
+
+jobs:
+  build-native:
+    name: Build ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            runner: ubuntu-latest
+            zig_target: x86_64-linux-gnu
+            install: sudo apt-get update && sudo apt-get install -y libpcap-dev
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+            zig_target: aarch64-linux-gnu
+            install: sudo apt-get update && sudo apt-get install -y libpcap-dev
+          - name: darwin-arm64
+            runner: macos-latest
+            zig_target: aarch64-macos
+            install: brew install libpcap
+          - name: darwin-amd64
+            runner: macos-13
+            zig_target: x86_64-macos
+            install: brew install libpcap
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install libpcap
+        run: ${{ matrix.install }}
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Resolve version
+        id: ver
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          # Strip leading 'v' for tags; use run id for manual dispatch
+          if [[ "$REF_NAME" == v* ]]; then
+            echo "v=${REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "v=0.0.0-dispatch-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        env:
+          VER: ${{ steps.ver.outputs.v }}
+          SHA: ${{ github.sha }}
+          TARGET: ${{ matrix.zig_target }}
+        run: |
+          zig build -Doptimize=ReleaseFast \
+            -Dtarget="$TARGET" \
+            -Dversion="$VER" \
+            -Dcommit="$SHA"
+
+      - name: Run tests (native only)
+        run: zig build test
+
+      - name: Stage artifact
+        env:
+          VER: ${{ steps.ver.outputs.v }}
+          NAME: ${{ matrix.name }}
+        run: |
+          mkdir -p dist
+          cp zig-out/bin/udp-proxy-2020 "dist/udp-proxy-2020-${VER}-${NAME}"
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: build-${{ matrix.name }}
+          path: dist/*
+          retention-days: 7
+
+  build-linux-armv7:
+    name: Build linux-armv7
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install libpcap for armhf
+        run: |
+          sudo dpkg --add-architecture armhf
+          sudo apt-get update
+          sudo apt-get install -y libpcap0.8-dev:armhf
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Resolve version
+        id: ver
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [[ "$REF_NAME" == v* ]]; then
+            echo "v=${REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "v=0.0.0-dispatch-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        env:
+          VER: ${{ steps.ver.outputs.v }}
+          SHA: ${{ github.sha }}
+        run: |
+          zig build -Doptimize=ReleaseFast \
+            -Dtarget=arm-linux-gnueabihf \
+            -Dlibpcap-path=/usr \
+            -Dversion="$VER" \
+            -Dcommit="$SHA"
+
+      - name: Stage artifact
+        env:
+          VER: ${{ steps.ver.outputs.v }}
+        run: |
+          mkdir -p dist
+          cp zig-out/bin/udp-proxy-2020 "dist/udp-proxy-2020-${VER}-linux-armv7"
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: build-linux-armv7
+          path: dist/*
+          retention-days: 7
+
+  build-freebsd:
+    name: Build freebsd-amd64 + freebsd-arm64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve version
+        id: ver
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [[ "$REF_NAME" == v* ]]; then
+            echo "v=${REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "v=0.0.0-dispatch-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build inside FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        env:
+          VER: ${{ steps.ver.outputs.v }}
+          SHA: ${{ github.sha }}
+          ZIG_VER: ${{ env.ZIG_VERSION }}
+        with:
+          release: '14.3'
+          usesh: true
+          copyback: true
+          envs: 'VER SHA ZIG_VER'
+          prepare: |
+            pkg install -y libpcap curl xz
+            fetch -q "https://ziglang.org/download/${ZIG_VER}/zig-x86_64-freebsd-${ZIG_VER}.tar.xz"
+            tar xf "zig-x86_64-freebsd-${ZIG_VER}.tar.xz"
+            mv "zig-x86_64-freebsd-${ZIG_VER}" /usr/local/zig
+          run: |
+            export PATH=/usr/local/zig:$PATH
+            mkdir -p dist
+
+            # Native amd64 build
+            zig build -Doptimize=ReleaseFast \
+              -Dversion="$VER" \
+              -Dcommit="$SHA"
+            cp zig-out/bin/udp-proxy-2020 "dist/udp-proxy-2020-${VER}-freebsd-amd64"
+
+            # Run tests on native build
+            zig build test
+
+            # Cross-compile arm64 — best-effort; needs aarch64 sysroot for full link,
+            # so we allow failure and just skip the arm64 artifact if it doesn't work.
+            zig build -Doptimize=ReleaseFast \
+              -Dtarget=aarch64-freebsd \
+              -Dversion="$VER" \
+              -Dcommit="$SHA" \
+              && cp zig-out/bin/udp-proxy-2020 "dist/udp-proxy-2020-${VER}-freebsd-arm64" \
+              || echo "freebsd-arm64 cross-compile failed (needs aarch64 sysroot) -- skipping"
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: build-freebsd
+          path: dist/*
+          retention-days: 7
+
+  release:
+    name: Create GitHub release
+    needs: [build-native, build-linux-armv7, build-freebsd]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          path: dist
+          pattern: build-*
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la dist/
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
