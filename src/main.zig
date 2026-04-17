@@ -218,8 +218,9 @@ pub fn main(proc_init: std.process.Init.Minimal) !void {
         var buf: [4096]u8 = undefined;
         const stdout = std.Io.File.stdout();
         var writer = stdout.writer(io, &buf);
-        try writer.interface.print("udp-proxy-2020 (Zig) Version {s}\n", .{version});
+        try writer.interface.print("udp-proxy-2020 (Zig) Version {s} -- Copyright 2025-2026 jrc2139\n", .{version});
         try writer.interface.print("{s} built with Zig {s}\n", .{ build_info, builtin.zig_version_string });
+        try writer.interface.print("Derived from udp-proxy-2020 (https://github.com/synfinatic/udp-proxy-2020) Copyright 2020-2026 Aaron Turner\n", .{});
         try writer.interface.flush();
         return;
     }
