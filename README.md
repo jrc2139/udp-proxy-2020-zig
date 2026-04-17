@@ -1,6 +1,6 @@
-# udp-proxy-2020
+# udp-proxy-2020-zig
 
-A high-performance UDP broadcast packet forwarder written in Zig. This is a port of the original Go-based [udp-proxy-2020](https://github.com/synfinatic/udp-proxy-2020) for improved performance.
+A high-performance UDP broadcast packet forwarder written in Zig. This is a port of the original Go-based [udp-proxy-2020](https://github.com/synfinatic/udp-proxy-2020) by [Aaron Turner](https://github.com/synfinatic).
 
 ## Overview
 
@@ -119,6 +119,18 @@ src/
 zig build test
 ```
 
+## Credits
+
+This project is a Zig port derived from the original Go implementation
+[udp-proxy-2020](https://github.com/synfinatic/udp-proxy-2020) by
+[Aaron Turner](https://github.com/synfinatic), Copyright (c) 2020-2026
+Aaron Turner, licensed under the MIT License. The architecture, protocol
+handling, BPF filter construction, and CLI interface of that project
+informed this port.
+
 ## License
 
-Same license as the original udp-proxy-2020 project.
+Copyright (C) 2025-2026 jrc2139
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE)
+for the full text and [NOTICE](NOTICE) for attribution details.

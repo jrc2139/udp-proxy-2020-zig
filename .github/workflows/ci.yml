@@ -11,12 +11,26 @@ env:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            runner: ubuntu-latest
+            install: sudo apt-get update && sudo apt-get install -y libpcap-dev
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+            install: sudo apt-get update && sudo apt-get install -y libpcap-dev
+          - name: darwin-arm64
+            runner: macos-latest
+            install: brew install libpcap
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+      - name: Install libpcap
+        run: ${{ matrix.install }}
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2

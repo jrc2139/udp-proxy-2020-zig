@@ -1,8 +1,21 @@
 udp-proxy-2020-zig - UDP proxy for Zig
-Copyright (C) 2025 jrc2139
+Copyright (C) 2025-2026 jrc2139
 
-This project is a Zig implementation inspired by:
+Licensed under the Apache License, Version 2.0 (the "License").
+You may not use this file except in compliance with the License.
+You may obtain a copy of the License at:
 
-udp-proxy-2020 (https://github.com/synfinatic/udp-proxy-2020)
-Copyright (c) synfinatic
-Licensed under MIT License
+    http://www.apache.org/licenses/LICENSE-2.0
+
+------------------------------------------------------------------------
+
+This project is a Zig port derived from and inspired by:
+
+    udp-proxy-2020
+    https://github.com/synfinatic/udp-proxy-2020
+    Copyright (c) 2020-2026 Aaron Turner
+    Licensed under the MIT License
+
+The original Go implementation's architecture, protocol handling, BPF
+filter construction, and CLI interface informed this Zig port. See the
+upstream project's LICENSE file for the full MIT license text.
