@@ -19,18 +19,22 @@ jobs:
             runner: ubuntu-latest
             zig_target: x86_64-linux-gnu
             install: sudo apt-get update && sudo apt-get install -y libpcap-dev
+            libpcap_path: /usr
           - name: linux-arm64
             runner: ubuntu-24.04-arm
             zig_target: aarch64-linux-gnu
             install: sudo apt-get update && sudo apt-get install -y libpcap-dev
+            libpcap_path: /usr
           - name: darwin-arm64
             runner: macos-latest
             zig_target: aarch64-macos
             install: brew install libpcap
+            libpcap_path: /opt/homebrew/opt/libpcap
           - name: darwin-amd64
             runner: macos-14
             zig_target: x86_64-macos
             install: brew install libpcap
+            libpcap_path: /usr/local/opt/libpcap
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
@@ -60,9 +64,11 @@ jobs:
           VER: ${{ steps.ver.outputs.v }}
           SHA: ${{ github.sha }}
           TARGET: ${{ matrix.zig_target }}
+          LIBPCAP_PATH: ${{ matrix.libpcap_path }}
         run: |
           zig build -Doptimize=ReleaseFast \
             -Dtarget="$TARGET" \
+            -Dlibpcap-path="$LIBPCAP_PATH" \
             -Dversion="$VER" \
             -Dcommit="$SHA"
 
