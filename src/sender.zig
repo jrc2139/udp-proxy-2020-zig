@@ -821,8 +821,10 @@ test "SendPktFeed: broadcast skips source interface" {
 }
 
 test "fastPatchEthernetPacket matches buildOutgoingPacketInto" {
-    // Build a valid Ethernet+IPv4+UDP packet
-    var original: [100]u8 = undefined;
+    // Buffers need 4-byte alignment because PacketBuilder casts the backing
+    // storage to *IPv4Header (u32 fields); stack u8 arrays default to align 1.
+    // Production uses heap-allocated pools which already meet the alignment.
+    var original: [100]u8 align(4) = undefined;
     var builder = packet.PacketBuilder.init(&original);
 
     const src_mac = [_]u8{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55 };
@@ -847,11 +849,11 @@ test "fastPatchEthernetPacket matches buildOutgoingPacketInto" {
     const new_src_mac = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x00, 0x01 };
 
     // Build via full path
-    var buf_full: [MAX_PACKET_SIZE]u8 = undefined;
+    var buf_full: [MAX_PACKET_SIZE]u8 align(4) = undefined;
     const full_result = try buildOutgoingPacketInto(&buf_full, parsed, new_dst_ip, .ethernet, new_src_mac);
 
     // Build via fast path
-    var buf_fast: [MAX_PACKET_SIZE]u8 = undefined;
+    var buf_fast: [MAX_PACKET_SIZE]u8 align(4) = undefined;
     const fast_result = try fastPatchEthernetPacket(&buf_fast, pkt_data, new_dst_ip, new_src_mac);
 
     // Both should produce identical output
