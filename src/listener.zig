@@ -62,6 +62,8 @@ pub const Listener = struct {
     client_cache: ClientCache,
     /// Ref channel for receiving packet refs to forward (zero-copy, thread mode)
     ref_channel: ?*sender.RefChannel,
+    /// Interface index in the SendPktFeed (for compact PacketRef)
+    iface_idx: u8,
     /// Reference to the SendPktFeed for accessing packet data (thread mode)
     feed: ?*sender.SendPktFeed,
     /// Pre-allocated buffer pool for outgoing packets
@@ -84,6 +86,7 @@ pub const Listener = struct {
             .broadcast_ip = null,
             .client_cache = ClientCache.init(allocator, config.cache_ttl_minutes),
             .ref_channel = null,
+            .iface_idx = 0,
             .feed = null,
             .outgoing_pool = sender.OutgoingPool.init(),
             .in_dumper = null,
@@ -153,6 +156,8 @@ pub const Listener = struct {
         try handle.setSnaplen(9000);
         try handle.setPromisc(true);
         try handle.setTimeout(self.config.timeout_ms);
+        try handle.setImmediateMode(true); // deliver packets without BPF buffering delay
+        try handle.setBufferSize(4 * 1024 * 1024); // 4MB kernel buffer (default is 512KB-2MB)
 
         // Activate
         try handle.activate();
@@ -224,13 +229,28 @@ pub const Listener = struct {
 
     /// Register with the send feed (thread mode)
     pub fn registerSender(self: *Listener, feed: *sender.SendPktFeed) !void {
-        self.ref_channel = try feed.registerSender(self.config.iface_name);
+        const result = try feed.registerSender(self.config.iface_name);
+        self.ref_channel = result.channel;
+        self.iface_idx = result.idx;
         self.feed = feed;
     }
 
     /// Main packet handling loop (zero-copy version, thread mode)
     pub fn run(self: *Listener, feed: *sender.SendPktFeed) void {
         self.running = true;
+
+        // Set non-blocking mode for normal (non-send-only) listeners
+        // so we can interleave pcap capture with ref channel draining
+        if (!self.config.send_only) {
+            if (self.handle) |*h| {
+                h.setNonBlock(true) catch |err| {
+                    log.warn("{s}: failed to set non-blocking mode: {}", .{ self.config.iface_name, err });
+                };
+            }
+        }
+
+        // Cache the selectable fd for poll() (null on platforms that don't support it)
+        const pcap_fd: ?std.posix.fd_t = if (self.handle) |*h| h.getSelectableFd() else null;
 
         // Cleanup timer (every 30 seconds - less aggressive than before)
         var last_cleanup = milliTimestamp();
@@ -256,26 +276,47 @@ pub const Listener = struct {
                     }
                 }
             } else {
-                // Normal mode: capture packets and check ref channel
-                // Check for packets to send from other interfaces (non-blocking)
+                // Non-blocking event loop: service both pcap capture and
+                // ref channel every iteration, sleep only when idle.
+                var did_work = false;
+
+                // 1. Drain ref channel (forward queued packets from other interfaces)
                 if (self.ref_channel) |channel| {
                     while (channel.tryReceive()) |ref| {
                         self.sendPacketsFromRef(ref) catch |err| {
                             log.warn("{s}: failed to send packet: {}", .{ self.config.iface_name, err });
                         };
+                        did_work = true;
                     }
                 }
 
-                // Capture incoming packets (blocks for up to timeout_ms)
+                // 2. Drain pcap (capture all available packets, non-blocking)
                 if (self.handle) |*handle| {
-                    if (handle.nextPacket()) |result| {
-                        if (result) |pkt_data| {
-                            self.handleIncomingPacket(pkt_data.data, pkt_data.info, feed);
+                    while (true) {
+                        if (handle.nextPacket()) |result| {
+                            if (result) |pkt_data| {
+                                self.handleIncomingPacket(pkt_data.data, pkt_data.info, feed);
+                                did_work = true;
+                            } else break; // no more packets available
+                        } else |err| {
+                            if (err != pcap.Error.NoMorePackets) {
+                                log.warn("{s}: capture error: {}", .{ self.config.iface_name, err });
+                            }
+                            break;
                         }
-                    } else |err| {
-                        if (err != pcap.Error.NoMorePackets) {
-                            log.warn("{s}: capture error: {}", .{ self.config.iface_name, err });
-                        }
+                    }
+                }
+
+                // 3. Sleep if idle (poll pcap fd for 1ms to avoid CPU spin)
+                if (!did_work) {
+                    if (pcap_fd) |fd| {
+                        var pfds = [_]std.posix.pollfd{
+                            .{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 },
+                        };
+                        _ = std.posix.poll(&pfds, 1) catch {};
+                    } else {
+                        const req = std.c.timespec{ .sec = 0, .nsec = 1_000_000 }; // 1ms
+                        _ = std.c.nanosleep(&req, null);
                     }
                 }
             }
@@ -316,19 +357,24 @@ pub const Listener = struct {
             d.writePacket(info, data);
         }
 
-        // Broadcast to other interfaces
+        // Broadcast to other interfaces with pre-computed offsets (avoids re-parsing)
         log.debug("{s}: forwarding packet ({d} bytes)", .{ self.config.iface_name, data.len });
+
+        const l2_size = sender.linkTypeL2Size(self.link_type);
+        const ip_hl: u8 = @intCast(parsed.ipv4.?.getHeaderLength());
 
         feed.broadcast(
             data,
-            self.config.iface_name,
+            self.iface_idx,
             self.link_type,
-            info.timestamp_sec,
-            info.timestamp_usec,
+            l2_size,
+            ip_hl,
+            info.timestamp_sec * 1_000_000 + info.timestamp_usec,
         );
     }
 
-    /// Send packets from a packet reference (zero-copy version)
+    /// Send packets from a packet reference (zero-copy version).
+    /// Uses pre-computed header offsets from PacketRef to skip re-parsing.
     fn sendPacketsFromRef(self: *Listener, ref: sender.PacketRef) !void {
         // Get packet data from the shared ring buffer
         const pkt_data = if (self.feed) |feed|
@@ -336,14 +382,26 @@ pub const Listener = struct {
         else
             return error.NoFeed;
 
-        // Parse the incoming packet
-        const parsed = packet.parsePacket(pkt_data, ref.link_type) catch |err| {
-            log.warn("{s}: failed to parse packet from {s}: {}", .{
-                self.config.iface_name,
-                ref.src_interface,
-                err,
+        // Reconstruct parsed packet from pre-computed offsets (NO parsePacket call)
+        const min_len = @as(usize, ref.l2_size) + ref.ip_header_len + packet.UDP_HEADER_SIZE;
+        if (pkt_data.len < min_len) {
+            log.warn("{s}: packet too short from iface {d}: {d} < {d}", .{
+                self.config.iface_name, ref.src_iface_idx, pkt_data.len, min_len,
             });
             return;
+        }
+
+        const ipv4: *const packet.IPv4Header = @ptrCast(@alignCast(pkt_data.ptr + ref.l2_size));
+        const udp: *const packet.UdpHeader = @ptrCast(@alignCast(pkt_data.ptr + ref.l2_size + ref.ip_header_len));
+        const payload_start = @as(usize, ref.l2_size) + ref.ip_header_len + packet.UDP_HEADER_SIZE;
+        const payload = if (payload_start < pkt_data.len) pkt_data[payload_start..] else &[_]u8{};
+
+        const parsed = packet.ParsedPacket{
+            .link_type = sender.idxToLinkType(ref.link_type_idx),
+            .ipv4 = ipv4,
+            .udp = udp,
+            .payload = payload,
+            .raw_data = pkt_data,
         };
 
         // Determine destination IPs
@@ -388,20 +446,32 @@ pub const Listener = struct {
         // Acquire buffer from pre-allocated pool (no allocation!)
         const buffer = self.outgoing_pool.acquire();
 
-        // Build the outgoing packet into pre-allocated buffer
-        const out_data = try sender.buildOutgoingPacketInto(
-            buffer,
-            parsed,
-            dst_ip,
-            self.link_type,
-            self.hw_addr,
-        );
+        // Fast path: Ethernet-to-Ethernet with standard IPv4 (no options)
+        // Just memcpy + patch dst_mac/src_mac/dst_ip/checksum
+        const out_data = if (ref.link_type_idx == 0 and // source is Ethernet
+            self.link_type == .ethernet and // dest is Ethernet
+            ref.ip_header_len == packet.IPV4_MIN_HEADER_SIZE) // standard IPv4, no options
+            try sender.fastPatchEthernetPacket(
+                buffer,
+                self.feed.?.getPacketData(ref.ring_idx),
+                dst_ip,
+                self.hw_addr,
+            )
+        else
+            // Full rebuild for cross-link-type or IPv4-with-options cases
+            try sender.buildOutgoingPacketInto(
+                buffer,
+                parsed,
+                dst_ip,
+                self.link_type,
+                self.hw_addr,
+            );
 
         // Write to debug pcap
         if (self.out_dumper) |*d| {
             const info = pcap.CaptureInfo{
-                .timestamp_sec = ref.timestamp_sec,
-                .timestamp_usec = ref.timestamp_usec,
+                .timestamp_sec = @divTrunc(ref.timestamp_us, 1_000_000),
+                .timestamp_usec = @mod(ref.timestamp_us, 1_000_000),
                 .capture_len = @intCast(out_data.len),
                 .wire_len = @intCast(out_data.len),
             };

@@ -69,6 +69,8 @@ extern "c" fn pcap_setdirection(p: *pcap_t, d: c_int) c_int;
 extern "c" fn pcap_next_ex(p: *pcap_t, pkt_header: *?*pcap_pkthdr, pkt_data: *?[*]const u8) c_int;
 extern "c" fn pcap_inject(p: *pcap_t, buf: [*]const u8, size: usize) c_int;
 extern "c" fn pcap_get_selectable_fd(p: *pcap_t) c_int;
+extern "c" fn pcap_set_immediate_mode(p: *pcap_t, immediate_mode: c_int) c_int;
+extern "c" fn pcap_set_buffer_size(p: *pcap_t, buffer_size: c_int) c_int;
 extern "c" fn pcap_setnonblock(p: *pcap_t, nonblock: c_int, errbuf: [*]u8) c_int;
 extern "c" fn pcap_close(p: *pcap_t) void;
 extern "c" fn pcap_dump_open(p: *pcap_t, fname: [*:0]const u8) ?*pcap_dumper_t;
@@ -234,6 +236,24 @@ pub const Handle = struct {
         if (pcap_set_timeout(self.handle, timeout_ms) != 0) {
             log.err("pcap_set_timeout failed", .{});
             return Error.TimeoutFailed;
+        }
+    }
+
+    /// Set immediate mode (deliver packets without buffering)
+    pub fn setImmediateMode(self: *Handle, immediate: bool) Error!void {
+        if (self.activated) return Error.AlreadyActivated;
+        if (pcap_set_immediate_mode(self.handle, if (immediate) 1 else 0) != 0) {
+            log.err("pcap_set_immediate_mode failed", .{});
+            return Error.ActivationFailed;
+        }
+    }
+
+    /// Set the kernel capture buffer size in bytes
+    pub fn setBufferSize(self: *Handle, size: c_int) Error!void {
+        if (self.activated) return Error.AlreadyActivated;
+        if (pcap_set_buffer_size(self.handle, size) != 0) {
+            log.err("pcap_set_buffer_size failed", .{});
+            return Error.ActivationFailed;
         }
     }
 
