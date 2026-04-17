@@ -91,37 +91,21 @@ pub fn build(b: *std.Build) void {
 }
 
 /// Wire libpcap into the given module. Uses the explicit `libpcap-path` if
-/// provided, otherwise auto-adds FreeBSD's `/usr/local` paths where `pkg`
-/// installs libpcap.
+/// provided (expects a `lib/` and `include/` layout, which is what libpcap's
+/// configure `--prefix=DIR` produces); otherwise auto-adds FreeBSD's
+/// `/usr/local` paths where `pkg` installs libpcap.
 fn linkPcap(
     mod: *std.Build.Module,
     target: std.Build.ResolvedTarget,
     libpcap_path: ?[]const u8,
     b: *std.Build,
 ) void {
-    const tgt = target.result;
     if (libpcap_path) |p| {
         mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ p, "lib" }) });
         mod.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ p, "include" }) });
-        if (tgt.os.tag == .linux) {
-            // Also add Debian/Ubuntu multiarch subdir so `-Dlibpcap-path=/usr`
-            // finds the library when it lives under /usr/lib/<triple>/.
-            if (linuxMultiarch(tgt.cpu.arch)) |triple| {
-                mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ p, "lib", triple }) });
-            }
-        }
-    } else if (tgt.os.tag == .freebsd) {
+    } else if (target.result.os.tag == .freebsd) {
         mod.addLibraryPath(.{ .cwd_relative = "/usr/local/lib" });
         mod.addIncludePath(.{ .cwd_relative = "/usr/local/include" });
     }
     mod.linkSystemLibrary("pcap", .{});
-}
-
-fn linuxMultiarch(arch: std.Target.Cpu.Arch) ?[]const u8 {
-    return switch (arch) {
-        .x86_64 => "x86_64-linux-gnu",
-        .aarch64 => "aarch64-linux-gnu",
-        .arm => "arm-linux-gnueabihf",
-        else => null,
-    };
 }
