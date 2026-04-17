@@ -164,7 +164,7 @@ jobs:
           copyback: true
           envs: 'VER SHA ZIG_VER'
           prepare: |
-            pkg install -y libpcap curl xz
+            pkg install -y libpcap curl
             fetch -q "https://ziglang.org/download/${ZIG_VER}/zig-x86_64-freebsd-${ZIG_VER}.tar.xz"
             tar xf "zig-x86_64-freebsd-${ZIG_VER}.tar.xz"
             mv "zig-x86_64-freebsd-${ZIG_VER}" /usr/local/zig
