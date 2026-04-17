@@ -8,7 +8,7 @@ udp-proxy-2020 forwards UDP broadcast packets between network interfaces using l
 
 ## Requirements
 
-- Zig 0.15.x
+- Zig 0.16.x
 - libpcap (included in FreeBSD base system, `libpcap-dev` on Debian/Ubuntu)
 
 ## Building
