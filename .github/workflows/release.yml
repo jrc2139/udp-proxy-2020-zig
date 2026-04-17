@@ -97,7 +97,26 @@ jobs:
 
       - name: Install libpcap for armhf
         run: |
+          set -eux
           sudo dpkg --add-architecture armhf
+          # On Noble, the main archive only hosts amd64/arm64; armhf lives on
+          # ports.ubuntu.com. Constrain the existing sources to amd64 and add
+          # a dedicated armhf source, else apt-get update 404s on armhf indexes.
+          CODENAME="$(lsb_release -cs)"
+          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+            sudo sed -i '/^Types: deb/ a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources
+          fi
+          if [ -f /etc/apt/sources.list ]; then
+            sudo sed -i 's|^deb |deb [arch=amd64] |' /etc/apt/sources.list
+          fi
+          sudo tee /etc/apt/sources.list.d/armhf.sources >/dev/null <<EOF
+          Types: deb
+          URIs: http://ports.ubuntu.com/ubuntu-ports
+          Suites: ${CODENAME} ${CODENAME}-updates ${CODENAME}-backports ${CODENAME}-security
+          Components: main universe
+          Architectures: armhf
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          EOF
           sudo apt-get update
           sudo apt-get install -y libpcap0.8-dev:armhf
 
