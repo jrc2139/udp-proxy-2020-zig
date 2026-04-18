@@ -43,8 +43,10 @@ pub const ClientCache = struct {
     ttl_ms: i64,
     /// Mutex for thread safety
     mutex: std.Io.Mutex,
-    /// Cleanup epoch - incremented on each cleanup to signal iterators
-    cleanup_epoch: std.atomic.Value(u64),
+    /// Cleanup epoch - incremented on each cleanup to signal iterators.
+    /// u32 so fetchAdd lowers on 32-bit targets (armv7) where Zig's stdlib
+    /// rejects 64-bit @atomicRmw; ~4B cycles at ~30s per cleanup is plenty.
+    cleanup_epoch: std.atomic.Value(u32),
 
     /// Initialize a new client cache
     pub fn init(allocator: std.mem.Allocator, ttl_minutes: u32) ClientCache {
@@ -55,7 +57,7 @@ pub const ClientCache = struct {
             .allocator = allocator,
             .ttl_ms = ttl_ms,
             .mutex = std.Io.Mutex.init,
-            .cleanup_epoch = std.atomic.Value(u64).init(0),
+            .cleanup_epoch = std.atomic.Value(u32).init(0),
         };
     }
 
