@@ -50,31 +50,40 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
 
-      - name: Build libpcap ${{ env.LIBPCAP_VERSION }} (${{ matrix.zig_target }})
+      - name: Resolve libpcap path
+        id: pcap
         env:
           ZIG_TARGET: ${{ matrix.zig_target }}
           HOST_TRIPLE: ${{ matrix.host_triple }}
         run: |
           set -eux
-          curl -sSL "https://www.tcpdump.org/release/libpcap-${LIBPCAP_VERSION}.tar.gz" | tar xzf -
-          cd "libpcap-${LIBPCAP_VERSION}"
-          PREFIX="${GITHUB_WORKSPACE}/libpcap-sysroot"
-          CC="zig cc -target ${ZIG_TARGET}" \
-          AR=ar \
-          RANLIB=ranlib \
-          ./configure \
-            --host="${HOST_TRIPLE}" \
-            --prefix="${PREFIX}" \
-            --disable-shared \
-            --disable-dbus \
-            --disable-usb \
-            --disable-netmap \
-            --disable-bluetooth \
-            --disable-rdma \
-            --disable-remote \
-            --without-libnl
-          make -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.logicalcpu)"
-          make install
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            # macOS SDK ships libpcap (.tbd stub) — just point at it
+            SDK="$(xcrun --show-sdk-path)"
+            echo "path=${SDK}/usr" >> "$GITHUB_OUTPUT"
+          else
+            # Linux: cross-compile libpcap from source into a local sysroot
+            curl -sSL "https://www.tcpdump.org/release/libpcap-${LIBPCAP_VERSION}.tar.gz" | tar xzf -
+            cd "libpcap-${LIBPCAP_VERSION}"
+            PREFIX="${GITHUB_WORKSPACE}/libpcap-sysroot"
+            CC="zig cc -target ${ZIG_TARGET}" \
+            AR=ar \
+            RANLIB=ranlib \
+            ./configure \
+              --host="${HOST_TRIPLE}" \
+              --prefix="${PREFIX}" \
+              --disable-shared \
+              --disable-dbus \
+              --disable-usb \
+              --disable-netmap \
+              --disable-bluetooth \
+              --disable-rdma \
+              --disable-remote \
+              --without-libnl
+            make -j"$(getconf _NPROCESSORS_ONLN)"
+            make install
+            echo "path=${PREFIX}" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Resolve version
         id: ver
@@ -93,7 +102,7 @@ jobs:
           VER: ${{ steps.ver.outputs.v }}
           SHA: ${{ github.sha }}
           TARGET: ${{ matrix.zig_target }}
-          LIBPCAP_PATH: ${{ github.workspace }}/libpcap-sysroot
+          LIBPCAP_PATH: ${{ steps.pcap.outputs.path }}
         run: |
           zig build -Doptimize=ReleaseFast \
             -Dtarget="$TARGET" \
@@ -104,7 +113,7 @@ jobs:
       - name: Run tests
         if: matrix.can_test
         env:
-          LIBPCAP_PATH: ${{ github.workspace }}/libpcap-sysroot
+          LIBPCAP_PATH: ${{ steps.pcap.outputs.path }}
         run: |
           zig build test -Dlibpcap-path="$LIBPCAP_PATH"
 
