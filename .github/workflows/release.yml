@@ -125,7 +125,7 @@ jobs:
           mkdir -p dist
           cp zig-out/bin/udp-proxy-2020 "dist/udp-proxy-2020-${VER}-${NAME}"
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: build-${{ matrix.name }}
           path: dist/*
@@ -186,7 +186,7 @@ jobs:
               && cp zig-out/bin/udp-proxy-2020 "dist/udp-proxy-2020-${VER}-freebsd-arm64" \
               || echo "freebsd-arm64 cross-compile failed (needs aarch64 sysroot) -- skipping"
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: build-freebsd
           path: dist/*
@@ -200,7 +200,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           pattern: build-*
@@ -209,7 +209,7 @@ jobs:
       - name: List artifacts
         run: ls -la dist/
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: dist/*
           generate_release_notes: true
