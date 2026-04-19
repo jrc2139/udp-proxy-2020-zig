@@ -1,6 +1,6 @@
 .{
     .name = .udp_proxy_2020,
-    .version = "0.1.0",
+    .version = "0.1.1",
     .fingerprint = 0x63ef4bd5df3d903c,
 
     .minimum_zig_version = "0.16.0",
