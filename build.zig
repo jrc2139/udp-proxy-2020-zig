@@ -22,6 +22,14 @@ pub fn build(b: *std.Build) void {
     const build_info_file = build_info_wf.add("build_info.zig", build_info_src);
     const build_info_mod = b.createModule(.{ .root_source_file = build_info_file });
 
+    // Tripwire module for errdefer-chain testing. Guarded by
+    // `builtin.is_test`, so check() calls inline away in non-test builds.
+    const tripwire_mod = b.createModule(.{
+        .root_source_file = b.path("src/testing/tripwire.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // -------------------------------------------------------------------------
     // UDP Proxy 2020 Executable
     // -------------------------------------------------------------------------
@@ -35,6 +43,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("build_info", build_info_mod);
+    exe.root_module.addImport("tripwire", tripwire_mod);
     linkPcap(exe.root_module, target, libpcap_path, b);
 
     b.installArtifact(exe);
@@ -64,6 +73,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     tests.root_module.addImport("build_info", build_info_mod);
+    tests.root_module.addImport("tripwire", tripwire_mod);
     linkPcap(tests.root_module, target, libpcap_path, b);
 
     const run_tests = b.addRunArtifact(tests);
@@ -84,6 +94,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     check_exe.root_module.addImport("build_info", build_info_mod);
+    check_exe.root_module.addImport("tripwire", tripwire_mod);
     linkPcap(check_exe.root_module, target, libpcap_path, b);
 
     const check_step = b.step("check", "Check for compilation errors (used by ZLS)");

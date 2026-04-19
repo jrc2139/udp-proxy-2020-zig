@@ -140,9 +140,64 @@ src/
 
 ### Testing
 - Each module contains its own unit tests
-- `tests.zig` aggregates all module tests via `std.testing.refAllDecls`
+- `tests.zig` aggregates all module tests via `std.testing.refAllDecls` — add each new module to this list or its tests won't run
 - Integration tests verify cross-module behavior
 - Run with `zig build test`
+
+#### Tripwire tests (errdefer coverage)
+
+`src/testing/tripwire.zig` is a vendored copy of Ghostty's tripwire module
+(MIT). It injects synthetic errors at named failure points to exercise
+`errdefer` chains in `init`-style functions. Compiles to no-ops in non-test
+builds via `enabled = builtin.is_test` + `.@"inline"` calling convention, so
+there is zero release cost.
+
+**When to add a tripwire**: any init function with two or more fallible
+allocations where a mid-sequence failure must unwind cleanly.
+
+**How to add one**:
+
+```zig
+const tripwire = @import("tripwire");
+
+pub const init_tw = tripwire.module(enum {
+    after_foo_alloc,
+    after_bar_alloc,
+}, error{OutOfMemory});
+
+pub fn init(a: std.mem.Allocator) !Self {
+    const foo = try a.create(Foo);
+    errdefer a.destroy(foo);
+    try init_tw.check(.after_foo_alloc);
+
+    const bar = try a.create(Bar);
+    errdefer a.destroy(bar);
+    try init_tw.check(.after_bar_alloc);
+    ...
+}
+
+test "init tripwires clean up at every point" {
+    inline for (std.meta.tags(init_tw.FailPoint)) |pt| {
+        init_tw.reset();
+        init_tw.errorAlways(pt, error.OutOfMemory);
+        try std.testing.expectError(
+            error.OutOfMemory,
+            init(std.testing.allocator),
+        );
+    }
+    init_tw.reset();
+}
+```
+
+`std.testing.allocator` panics the test on leak, so a missing `errdefer`
+for any failure point causes the test to fail.
+
+**Gotchas**:
+- `defer tw.reset()` inside `inline for` does **not** reset between
+  iterations (the defer binds to the enclosing function scope). Use an
+  explicit `tw.reset()` at the top of the loop body.
+- Existing examples: `Listener.init_tw` in `src/listener.zig`,
+  `SendPktFeed.feed_init_tw` in `src/sender.zig`.
 
 ## Common Development Tasks
 
