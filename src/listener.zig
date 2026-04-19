@@ -9,8 +9,19 @@ const packet = @import("packet.zig");
 const bpf = @import("bpf.zig");
 const sender = @import("sender.zig");
 const ClientCache = @import("client_cache.zig").ClientCache;
+const tripwire = @import("tripwire");
 
 const log = std.log.scoped(.listener);
+
+/// Tripwire points for Listener.init. Used only in tests to exercise the
+/// errdefer chain; inlined to no-ops in release builds.
+pub const init_tw = tripwire.module(enum {
+    /// Before any allocation (client_cache HashMap is lazy; nothing to free).
+    after_client_cache_init,
+    /// After the fixed_ips loop — HashMap backing is populated, so the
+    /// errdefer must fire or the buckets leak.
+    after_fixed_ips,
+}, error{OutOfMemory});
 
 /// Return milliseconds since Unix epoch using POSIX clock_gettime.
 fn milliTimestamp() i64 {
@@ -93,11 +104,18 @@ pub const Listener = struct {
             .out_dumper = null,
             .running = false,
         };
+        // If any fallible step below fails, the HashMap backing storage
+        // allocated by addFixed must be released, else we leak it.
+        errdefer self.client_cache.deinit();
+
+        try init_tw.check(.after_client_cache_init);
 
         // Add fixed IPs to cache
         for (config.fixed_ips) |ip| {
             try self.client_cache.addFixed(ip);
         }
+
+        try init_tw.check(.after_fixed_ips);
 
         return self;
     }
@@ -586,3 +604,30 @@ pub const UdpSink = struct {
         }
     }
 };
+
+test "Listener.init tripwires clean up on failure at every point" {
+    const config = ListenerConfig{
+        .iface_name = "lo",
+        .ports = &[_]u16{9003},
+        .timeout_ms = 100,
+        .cache_ttl_minutes = 5,
+        .fixed_ips = &[_][4]u8{.{ 10, 0, 0, 1 }},
+        .promisc = false,
+        .send_only = false,
+        .pcap_debug = false,
+        .pcap_path = "",
+    };
+
+    inline for (std.meta.tags(init_tw.FailPoint)) |pt| {
+        init_tw.reset();
+        init_tw.errorAlways(pt, error.OutOfMemory);
+
+        // std.testing.allocator panics the test on leak, so if errdefer
+        // cleanup is missing for this failure point, this test fails.
+        try std.testing.expectError(
+            error.OutOfMemory,
+            Listener.init(std.testing.allocator, config),
+        );
+    }
+    init_tw.reset();
+}

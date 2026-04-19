@@ -17,8 +17,15 @@
 const std = @import("std");
 const pcap = @import("pcap.zig");
 const packet = @import("packet.zig");
+const tripwire = @import("tripwire");
 
 const log = std.log.scoped(.sender);
+
+/// Tripwire points for SendPktFeed.init. Test-only; inlined to no-ops in
+/// release builds via tripwire.enabled = builtin.is_test.
+pub const feed_init_tw = tripwire.module(enum {
+    after_ring_alloc,
+}, error{OutOfMemory});
 
 // ============================================================================
 // Types
@@ -266,7 +273,10 @@ pub const SendPktFeed = struct {
 
     pub fn init(allocator: std.mem.Allocator) !SendPktFeed {
         const ring = try allocator.create(PacketRing);
+        errdefer allocator.destroy(ring);
         ring.* = PacketRing.init();
+
+        try feed_init_tw.check(.after_ring_alloc);
 
         return SendPktFeed{
             .senders = std.StringHashMap(*RefChannel).init(allocator),
@@ -892,4 +902,17 @@ test "SendPktFeed: allocation failure on registerSender" {
     } else |err| {
         try std.testing.expectEqual(error.OutOfMemory, err);
     }
+}
+
+test "SendPktFeed.init tripwires clean up on failure at every point" {
+    inline for (std.meta.tags(feed_init_tw.FailPoint)) |pt| {
+        feed_init_tw.reset();
+        feed_init_tw.errorAlways(pt, error.OutOfMemory);
+
+        try std.testing.expectError(
+            error.OutOfMemory,
+            SendPktFeed.init(std.testing.allocator),
+        );
+    }
+    feed_init_tw.reset();
 }
