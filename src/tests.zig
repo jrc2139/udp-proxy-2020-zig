@@ -19,6 +19,7 @@ test {
     std.testing.refAllDecls(bpf);
     std.testing.refAllDecls(client_cache);
     std.testing.refAllDecls(sender);
+    std.testing.refAllDecls(listener);
 }
 
 // ============================================================================
