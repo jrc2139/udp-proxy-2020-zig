@@ -7,6 +7,7 @@ on:
 
 env:
   ZIG_VERSION: "0.16.0"
+  LIBPCAP_VERSION: "1.10.5"
 
 jobs:
   build-native:
@@ -18,30 +19,71 @@ jobs:
           - name: linux-amd64
             runner: ubuntu-latest
             zig_target: x86_64-linux-gnu
-            install: sudo apt-get update && sudo apt-get install -y libpcap-dev
+            host_triple: x86_64-linux-gnu
+            can_test: true
           - name: linux-arm64
             runner: ubuntu-24.04-arm
             zig_target: aarch64-linux-gnu
-            install: sudo apt-get update && sudo apt-get install -y libpcap-dev
+            host_triple: aarch64-linux-gnu
+            can_test: true
+          - name: linux-armv7
+            runner: ubuntu-latest
+            zig_target: arm-linux-gnueabihf
+            host_triple: arm-linux-gnueabihf
+            can_test: false
           - name: darwin-arm64
             runner: macos-latest
             zig_target: aarch64-macos
-            install: brew install libpcap
+            host_triple: aarch64-apple-darwin
+            can_test: true
           - name: darwin-amd64
-            runner: macos-13
+            runner: macos-latest
             zig_target: x86_64-macos
-            install: brew install libpcap
+            host_triple: x86_64-apple-darwin
+            can_test: false
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
-
-      - name: Install libpcap
-        run: ${{ matrix.install }}
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
+
+      - name: Resolve libpcap path
+        id: pcap
+        env:
+          ZIG_TARGET: ${{ matrix.zig_target }}
+          HOST_TRIPLE: ${{ matrix.host_triple }}
+        run: |
+          set -eux
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            # macOS SDK ships libpcap (.tbd stub) — just point at it
+            SDK="$(xcrun --show-sdk-path)"
+            echo "path=${SDK}/usr" >> "$GITHUB_OUTPUT"
+          else
+            # Linux: cross-compile libpcap from source into a local sysroot
+            curl -sSL "https://www.tcpdump.org/release/libpcap-${LIBPCAP_VERSION}.tar.gz" | tar xzf -
+            cd "libpcap-${LIBPCAP_VERSION}"
+            PREFIX="${GITHUB_WORKSPACE}/libpcap-sysroot"
+            CC="zig cc -target ${ZIG_TARGET}" \
+            AR=ar \
+            RANLIB=ranlib \
+            ./configure \
+              --host="${HOST_TRIPLE}" \
+              --prefix="${PREFIX}" \
+              --disable-shared \
+              --disable-dbus \
+              --disable-usb \
+              --disable-netmap \
+              --disable-bluetooth \
+              --disable-rdma \
+              --disable-remote \
+              --without-libnl
+            make -j"$(getconf _NPROCESSORS_ONLN)"
+            make install
+            echo "path=${PREFIX}" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Resolve version
         id: ver
@@ -60,14 +102,20 @@ jobs:
           VER: ${{ steps.ver.outputs.v }}
           SHA: ${{ github.sha }}
           TARGET: ${{ matrix.zig_target }}
+          LIBPCAP_PATH: ${{ steps.pcap.outputs.path }}
         run: |
           zig build -Doptimize=ReleaseFast \
             -Dtarget="$TARGET" \
+            -Dlibpcap-path="$LIBPCAP_PATH" \
             -Dversion="$VER" \
             -Dcommit="$SHA"
 
-      - name: Run tests (native only)
-        run: zig build test
+      - name: Run tests
+        if: matrix.can_test
+        env:
+          LIBPCAP_PATH: ${{ steps.pcap.outputs.path }}
+        run: |
+          zig build test -Dlibpcap-path="$LIBPCAP_PATH"
 
       - name: Stage artifact
         env:
@@ -77,61 +125,9 @@ jobs:
           mkdir -p dist
           cp zig-out/bin/udp-proxy-2020 "dist/udp-proxy-2020-${VER}-${NAME}"
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: build-${{ matrix.name }}
-          path: dist/*
-          retention-days: 7
-
-  build-linux-armv7:
-    name: Build linux-armv7
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install libpcap for armhf
-        run: |
-          sudo dpkg --add-architecture armhf
-          sudo apt-get update
-          sudo apt-get install -y libpcap0.8-dev:armhf
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: ${{ env.ZIG_VERSION }}
-
-      - name: Resolve version
-        id: ver
-        env:
-          REF_NAME: ${{ github.ref_name }}
-        run: |
-          if [[ "$REF_NAME" == v* ]]; then
-            echo "v=${REF_NAME#v}" >> "$GITHUB_OUTPUT"
-          else
-            echo "v=0.0.0-dispatch-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Build
-        env:
-          VER: ${{ steps.ver.outputs.v }}
-          SHA: ${{ github.sha }}
-        run: |
-          zig build -Doptimize=ReleaseFast \
-            -Dtarget=arm-linux-gnueabihf \
-            -Dlibpcap-path=/usr \
-            -Dversion="$VER" \
-            -Dcommit="$SHA"
-
-      - name: Stage artifact
-        env:
-          VER: ${{ steps.ver.outputs.v }}
-        run: |
-          mkdir -p dist
-          cp zig-out/bin/udp-proxy-2020 "dist/udp-proxy-2020-${VER}-linux-armv7"
-
-      - uses: actions/upload-artifact@v5
-        with:
-          name: build-linux-armv7
           path: dist/*
           retention-days: 7
 
@@ -164,7 +160,7 @@ jobs:
           copyback: true
           envs: 'VER SHA ZIG_VER'
           prepare: |
-            pkg install -y libpcap curl xz
+            pkg install -y libpcap curl
             fetch -q "https://ziglang.org/download/${ZIG_VER}/zig-x86_64-freebsd-${ZIG_VER}.tar.xz"
             tar xf "zig-x86_64-freebsd-${ZIG_VER}.tar.xz"
             mv "zig-x86_64-freebsd-${ZIG_VER}" /usr/local/zig
@@ -190,7 +186,7 @@ jobs:
               && cp zig-out/bin/udp-proxy-2020 "dist/udp-proxy-2020-${VER}-freebsd-arm64" \
               || echo "freebsd-arm64 cross-compile failed (needs aarch64 sysroot) -- skipping"
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: build-freebsd
           path: dist/*
@@ -198,13 +194,13 @@ jobs:
 
   release:
     name: Create GitHub release
-    needs: [build-native, build-linux-armv7, build-freebsd]
+    needs: [build-native, build-freebsd]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           pattern: build-*
@@ -213,7 +209,7 @@ jobs:
       - name: List artifacts
         run: ls -la dist/
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: dist/*
           generate_release_notes: true

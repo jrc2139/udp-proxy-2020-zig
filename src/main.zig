@@ -135,9 +135,16 @@ fn customLog(
     log_mutex.lockUncancelable(undefined);
     defer log_mutex.unlock(undefined);
 
-    // Write via POSIX fd to avoid requiring io (std.Io.File.write requires io)
+    // Write via POSIX fd to avoid requiring io (std.Io.File.write requires io).
+    // Loop over partial writes so we don't drop the trailing '\n' and cause
+    // subsequent log entries to concatenate onto the same line.
     const fd: std.Io.File.Handle = if (log_file) |f| f.handle else std.Io.File.stderr().handle;
-    _ = std.c.write(fd, msg.ptr, msg.len);
+    var written: usize = 0;
+    while (written < msg.len) {
+        const n = std.c.write(fd, msg.ptr + written, msg.len - written);
+        if (n <= 0) break;
+        written += @intCast(n);
+    }
 }
 
 fn initLogFile(path: ?[]const u8) !void {

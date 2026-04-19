@@ -91,8 +91,9 @@ pub fn build(b: *std.Build) void {
 }
 
 /// Wire libpcap into the given module. Uses the explicit `libpcap-path` if
-/// provided, otherwise auto-adds FreeBSD's `/usr/local` paths where `pkg`
-/// installs libpcap.
+/// provided (expects a `lib/` and `include/` layout, which is what libpcap's
+/// configure `--prefix=DIR` produces); otherwise auto-adds FreeBSD's
+/// `/usr/local` paths where `pkg` installs libpcap.
 fn linkPcap(
     mod: *std.Build.Module,
     target: std.Build.ResolvedTarget,

@@ -68,18 +68,57 @@ pub const PacketRing = struct {
 };
 
 /// Lightweight packet reference - passed through channels instead of full packet data.
-/// Only 32 bytes vs 9KB for SendPacket.
+/// 16 bytes: fits in half a cache line. MpscRefQueue items fit in L1 cache (4KB).
 pub const PacketRef = struct {
     /// Index into the shared ring buffer
     ring_idx: u8,
-    /// Link type of source interface
-    link_type: pcap.LinkType,
-    /// Source interface name (pointer to static string in listener config)
-    src_interface: []const u8,
-    /// Capture timestamp
-    timestamp_sec: i64,
-    timestamp_usec: i64,
+    /// Compact link type index (0=ethernet, 1=null, 2=loop, 3=enc, 4=raw)
+    link_type_idx: u8,
+    /// Source interface index (into SendPktFeed.iface_channels)
+    src_iface_idx: u8,
+    /// L2 header size in bytes (offset to IPv4 header)
+    l2_size: u8,
+    /// IPv4 header length in bytes (usually 20)
+    ip_header_len: u8,
+    _pad: [3]u8 = .{ 0, 0, 0 },
+    /// Capture timestamp in microseconds since epoch
+    timestamp_us: i64,
 };
+
+/// Convert LinkType to compact index for PacketRef
+pub fn linkTypeToIdx(lt: pcap.LinkType) u8 {
+    return switch (lt) {
+        .ethernet => 0,
+        .null => 1,
+        .loop => 2,
+        .enc => 3,
+        .raw => 4,
+        else => 255,
+    };
+}
+
+/// Convert compact index back to LinkType
+pub fn idxToLinkType(idx: u8) pcap.LinkType {
+    return switch (idx) {
+        0 => .ethernet,
+        1 => .null,
+        2 => .loop,
+        3 => .enc,
+        4 => .raw,
+        else => .ethernet,
+    };
+}
+
+/// Get L2 header size for a link type
+pub fn linkTypeL2Size(lt: pcap.LinkType) u8 {
+    return switch (lt) {
+        .ethernet => packet.ETHERNET_HEADER_SIZE,
+        .null, .loop => packet.LOOPBACK_HEADER_SIZE,
+        .enc => packet.ENC_HEADER_SIZE,
+        .raw => 0,
+        else => 0,
+    };
+}
 
 /// Lock-free bounded MPSC queue for packet references.
 /// Based on Dmitry Vyukov's bounded MPSC queue with per-slot sequence numbers.
@@ -92,6 +131,9 @@ pub const MpscRefQueue = struct {
     items: [QUEUE_SIZE]PacketRef,
     sequence: [QUEUE_SIZE]std.atomic.Value(u32),
     write_pos: std.atomic.Value(u32),
+    // Cache-line padding: prevent false sharing between producer (write_pos)
+    // and consumer (read_pos) which would cause cache-line bouncing.
+    _cache_pad: [60]u8 = undefined,
     read_pos: u32, // only consumer touches this
 
     pub fn init() MpscRefQueue {
@@ -203,18 +245,24 @@ pub const RefChannel = struct {
     }
 };
 
-/// Packet feed that manages all send channels (zero-copy version)
-/// Uses RwLock: multiple broadcasts can happen concurrently (read),
-/// while registration is exclusive (write).
+/// Maximum number of interfaces supported
+pub const MAX_IFACES = 16;
+
+/// Packet feed that manages all send channels (zero-copy version).
+/// After registration, broadcast uses a frozen array of channels with no locks.
 pub const SendPktFeed = struct {
-    /// Map of interface name to ref channel
+    /// Indexed array of channels (populated during registration, immutable after)
+    iface_channels: [MAX_IFACES]*RefChannel = undefined,
+    /// Number of registered interfaces
+    iface_count: u8 = 0,
+    /// Map of interface name to ref channel (for cleanup and name lookup)
     senders: std.StringHashMap(*RefChannel),
     /// Shared packet ring buffer - stores actual packet data
     ring: *PacketRing,
     /// Allocator
     allocator: std.mem.Allocator,
-    /// RwLock for concurrent broadcast (read) vs exclusive registration (write)
-    rwlock: std.Io.RwLock,
+    /// Mutex for registration (not used in hot path)
+    reg_mutex: std.Io.Mutex,
 
     pub fn init(allocator: std.mem.Allocator) !SendPktFeed {
         const ring = try allocator.create(PacketRing);
@@ -224,46 +272,51 @@ pub const SendPktFeed = struct {
             .senders = std.StringHashMap(*RefChannel).init(allocator),
             .ring = ring,
             .allocator = allocator,
-            .rwlock = std.Io.RwLock.init,
+            .reg_mutex = std.Io.Mutex.init,
         };
     }
 
     pub fn deinit(self: *SendPktFeed) void {
-        self.rwlock.lockUncancelable(undefined);
-        defer self.rwlock.unlock(undefined);
-
         var key_iter = self.senders.keyIterator();
         while (key_iter.next()) |key| {
             self.allocator.free(key.*);
         }
 
-        var value_iter = self.senders.valueIterator();
-        while (value_iter.next()) |channel| {
-            channel.*.close();
-            channel.*.deinit();
-            self.allocator.destroy(channel.*);
+        for (0..self.iface_count) |i| {
+            self.iface_channels[i].close();
+            self.iface_channels[i].deinit();
+            self.allocator.destroy(self.iface_channels[i]);
         }
         self.senders.deinit();
         self.allocator.destroy(self.ring);
     }
 
-    /// Register a ref channel for an interface (exclusive write lock)
-    pub fn registerSender(self: *SendPktFeed, iface_name: []const u8) !*RefChannel {
-        self.rwlock.lockUncancelable(undefined);
-        defer self.rwlock.unlock(undefined);
+    /// Register a ref channel for an interface. Returns the interface index.
+    pub fn registerSender(self: *SendPktFeed, iface_name: []const u8) !struct { channel: *RefChannel, idx: u8 } {
+        self.reg_mutex.lockUncancelable(undefined);
+        defer self.reg_mutex.unlock(undefined);
+
+        if (self.iface_count >= MAX_IFACES) {
+            log.err("Too many interfaces (max {d})", .{MAX_IFACES});
+            return error.TooManyInterfaces;
+        }
 
         // Create new channel
         const channel = try self.allocator.create(RefChannel);
         channel.* = RefChannel.init();
 
-        // Copy interface name for the key
+        // Copy interface name for the map key
         const name_copy = try self.allocator.dupe(u8, iface_name);
-
         try self.senders.put(name_copy, channel);
 
-        log.debug("Registered sender for interface: {s}", .{iface_name});
+        // Add to indexed array
+        const idx = self.iface_count;
+        self.iface_channels[idx] = channel;
+        self.iface_count += 1;
 
-        return channel;
+        log.debug("Registered sender for interface: {s} (idx={d})", .{ iface_name, idx });
+
+        return .{ .channel = channel, .idx = idx };
     }
 
     /// Get packet data from the shared ring buffer
@@ -271,56 +324,47 @@ pub const SendPktFeed = struct {
         return self.ring.get(ring_idx);
     }
 
-    /// Broadcast a packet to all interfaces except the source (zero-copy)
-    /// Stores packet data once in ring buffer, sends lightweight refs to all channels.
-    /// Uses shared read lock - multiple broadcasts can happen concurrently.
+    /// Broadcast a packet to all interfaces except the source (zero-copy).
+    /// Uses frozen array -- no locks, no hash map iteration in the hot path.
     pub fn broadcast(
         self: *SendPktFeed,
         data: []const u8,
-        src_interface: []const u8,
+        src_iface_idx: u8,
         link_type: pcap.LinkType,
-        timestamp_sec: i64,
-        timestamp_usec: i64,
+        l2_size: u8,
+        ip_header_len: u8,
+        timestamp_us: i64,
     ) void {
         if (data.len > MAX_PACKET_SIZE) {
             log.warn("Packet too large to broadcast: {d} bytes", .{data.len});
             return;
         }
 
-        // Store packet data in ring buffer (one copy, outside lock)
+        // Store packet data in ring buffer (one copy)
         const ring_idx = self.ring.store(data);
 
-        // Create lightweight ref (32 bytes vs 9KB)
+        // Create compact ref (16 bytes)
         const ref = PacketRef{
             .ring_idx = ring_idx,
-            .link_type = link_type,
-            .src_interface = src_interface,
-            .timestamp_sec = timestamp_sec,
-            .timestamp_usec = timestamp_usec,
+            .link_type_idx = linkTypeToIdx(link_type),
+            .src_iface_idx = src_iface_idx,
+            .l2_size = l2_size,
+            .ip_header_len = ip_header_len,
+            .timestamp_us = timestamp_us,
         };
 
-        // Shared read lock - allows concurrent broadcasts from multiple interfaces
-        self.rwlock.lockSharedUncancelable(undefined);
-        defer self.rwlock.unlockShared(undefined);
-
-        var iter = self.senders.iterator();
-        while (iter.next()) |entry| {
-            // Skip the source interface
-            if (std.mem.eql(u8, entry.key_ptr.*, src_interface)) {
-                continue;
-            }
-
-            entry.value_ptr.*.send(ref) catch |err| {
-                log.warn("Failed to send ref to {s}: {}", .{ entry.key_ptr.*, err });
+        // Iterate frozen array -- no lock needed, array is immutable after startup
+        for (0..self.iface_count) |i| {
+            if (i == src_iface_idx) continue;
+            self.iface_channels[i].send(ref) catch |err| {
+                log.warn("Failed to send ref to iface {d}: {}", .{ i, err });
             };
         }
     }
 
     /// Get the number of registered senders
     pub fn count(self: *SendPktFeed) usize {
-        self.rwlock.lockSharedUncancelable(undefined);
-        defer self.rwlock.unlockShared(undefined);
-        return self.senders.count();
+        return self.iface_count;
     }
 };
 
@@ -440,6 +484,40 @@ pub fn buildOutgoingPacketInto(
     return builder.getData();
 }
 
+/// Fast-path for Ethernet-to-Ethernet forwarding with standard IPv4 header (IHL=5).
+/// Instead of rebuilding the packet header-by-header via PacketBuilder, this does
+/// a single memcpy of the entire packet then patches only the bytes that change:
+/// dst MAC (6B), src MAC (6B), dst IP (4B), and IP checksum (2B).
+pub fn fastPatchEthernetPacket(
+    buffer: []u8,
+    original: []const u8,
+    dst_ip: [4]u8,
+    src_mac: [6]u8,
+) ![]u8 {
+    if (original.len > buffer.len) return error.BufferTooSmall;
+    if (original.len < packet.ETHERNET_HEADER_SIZE + packet.IPV4_MIN_HEADER_SIZE)
+        return error.PacketTooShort;
+
+    // Single memcpy of entire packet
+    @memcpy(buffer[0..original.len], original);
+
+    // Patch destination MAC to broadcast (bytes 0-5)
+    @memcpy(buffer[0..6], &packet.BROADCAST_MAC);
+
+    // Patch source MAC (bytes 6-11)
+    @memcpy(buffer[6..12], &src_mac);
+
+    // Patch destination IP (ETH=14 + version_ihl=1 + tos=1 + total_length=2 +
+    // identification=2 + flags_fragment=2 + ttl=1 + protocol=1 + checksum=2 + src_ip=4 = offset 30)
+    @memcpy(buffer[30..34], &dst_ip);
+
+    // Recalculate IP checksum
+    const ipv4: *packet.IPv4Header = @ptrCast(@alignCast(buffer.ptr + packet.ETHERNET_HEADER_SIZE));
+    packet.calculateIpChecksum(ipv4);
+
+    return buffer[0..original.len];
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -450,9 +528,11 @@ test "SendPktFeed registration" {
     var feed = try SendPktFeed.init(allocator);
     defer feed.deinit();
 
-    _ = try feed.registerSender("eth0");
-    _ = try feed.registerSender("eth1");
+    const r0 = try feed.registerSender("eth0");
+    const r1 = try feed.registerSender("eth1");
 
+    try std.testing.expectEqual(@as(u8, 0), r0.idx);
+    try std.testing.expectEqual(@as(u8, 1), r1.idx);
     try std.testing.expectEqual(@as(usize, 2), feed.count());
 }
 
@@ -483,10 +563,11 @@ test "OutgoingPool round-robin" {
 fn makeRef(idx: u8) PacketRef {
     return PacketRef{
         .ring_idx = idx,
-        .link_type = .ethernet,
-        .src_interface = "test",
-        .timestamp_sec = 0,
-        .timestamp_usec = 0,
+        .link_type_idx = 0, // ethernet
+        .src_iface_idx = 0,
+        .l2_size = 14,
+        .ip_header_len = 20,
+        .timestamp_us = 0,
     };
 }
 
@@ -714,10 +795,13 @@ test "SendPktFeed: register multiple senders" {
     var feed = try SendPktFeed.init(allocator);
     defer feed.deinit();
 
-    _ = try feed.registerSender("eth0");
-    _ = try feed.registerSender("eth1");
-    _ = try feed.registerSender("wg0");
+    const r0 = try feed.registerSender("eth0");
+    const r1 = try feed.registerSender("eth1");
+    const r2 = try feed.registerSender("wg0");
 
+    try std.testing.expectEqual(@as(u8, 0), r0.idx);
+    try std.testing.expectEqual(@as(u8, 1), r1.idx);
+    try std.testing.expectEqual(@as(u8, 2), r2.idx);
     try std.testing.expectEqual(@as(usize, 3), feed.count());
 }
 
@@ -726,14 +810,66 @@ test "SendPktFeed: broadcast skips source interface" {
     var feed = try SendPktFeed.init(allocator);
     defer feed.deinit();
 
-    const ch_a = try feed.registerSender("eth0");
-    const ch_b = try feed.registerSender("eth1");
+    const r_a = try feed.registerSender("eth0");
+    const r_b = try feed.registerSender("eth1");
 
-    // Broadcast from eth0 -- should only go to eth1
-    feed.broadcast("hello", "eth0", .ethernet, 0, 0);
+    // Broadcast from eth0 (idx=0) -- should only go to eth1
+    feed.broadcast("hello", r_a.idx, .ethernet, 14, 20, 0);
 
-    try std.testing.expect(ch_a.tryReceive() == null); // skipped
-    try std.testing.expect(ch_b.tryReceive() != null); // received
+    try std.testing.expect(r_a.channel.tryReceive() == null); // skipped
+    try std.testing.expect(r_b.channel.tryReceive() != null); // received
+}
+
+test "fastPatchEthernetPacket matches buildOutgoingPacketInto" {
+    // Buffers need 4-byte alignment because PacketBuilder casts the backing
+    // storage to *IPv4Header (u32 fields); stack u8 arrays default to align 1.
+    // Production uses heap-allocated pools which already meet the alignment.
+    var original: [100]u8 align(4) = undefined;
+    var builder = packet.PacketBuilder.init(&original);
+
+    const src_mac = [_]u8{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55 };
+    const dst_mac = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };
+    _ = try builder.addEthernet(src_mac, dst_mac, .ipv4);
+    const ipv4 = try builder.addIPv4(.{ 192, 168, 1, 1 }, .{ 192, 168, 1, 255 }, .udp, 64);
+    const udp_hdr = try builder.addUDP(9003, 9003);
+    try builder.addPayload("hello world");
+
+    const ip_total: u16 = @intCast(packet.IPV4_MIN_HEADER_SIZE + packet.UDP_HEADER_SIZE + 11);
+    ipv4.setTotalLength(ip_total);
+    const udp_total: u16 = @intCast(packet.UDP_HEADER_SIZE + 11);
+    udp_hdr.setLength(udp_total);
+    packet.calculateIpChecksum(ipv4);
+
+    const pkt_data = builder.getData();
+
+    // Parse for buildOutgoingPacketInto
+    const parsed = try packet.parsePacket(pkt_data, .ethernet);
+
+    const new_dst_ip = [_]u8{ 10, 0, 0, 1 };
+    const new_src_mac = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x00, 0x01 };
+
+    // Build via full path
+    var buf_full: [MAX_PACKET_SIZE]u8 align(4) = undefined;
+    const full_result = try buildOutgoingPacketInto(&buf_full, parsed, new_dst_ip, .ethernet, new_src_mac);
+
+    // Build via fast path
+    var buf_fast: [MAX_PACKET_SIZE]u8 align(4) = undefined;
+    const fast_result = try fastPatchEthernetPacket(&buf_fast, pkt_data, new_dst_ip, new_src_mac);
+
+    // Both should produce identical output
+    try std.testing.expectEqual(full_result.len, fast_result.len);
+    try std.testing.expectEqualSlices(u8, full_result, fast_result);
+}
+
+test "compact PacketRef is 16 bytes" {
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(PacketRef));
+}
+
+test "linkType round-trip conversion" {
+    const types = [_]pcap.LinkType{ .ethernet, .null, .loop, .enc, .raw };
+    for (types) |lt| {
+        try std.testing.expectEqual(lt, idxToLinkType(linkTypeToIdx(lt)));
+    }
 }
 
 test "SendPktFeed: allocation failure on init" {
@@ -751,6 +887,9 @@ test "SendPktFeed: allocation failure on registerSender" {
     var feed = try SendPktFeed.init(failing.allocator());
     defer feed.deinit();
 
-    const result = feed.registerSender("eth0");
-    try std.testing.expectError(error.OutOfMemory, result);
+    if (feed.registerSender("eth0")) |_| {
+        try std.testing.expect(false); // should not succeed
+    } else |err| {
+        try std.testing.expectEqual(error.OutOfMemory, err);
+    }
 }
