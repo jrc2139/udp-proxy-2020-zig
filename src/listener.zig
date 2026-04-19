@@ -417,13 +417,17 @@ pub const Listener = struct {
 
             while (client_iter.next()) |client_ip| {
                 self.sendToDestinationZeroCopy(parsed, client_ip, ref) catch |err| {
-                    log.warn("{s}: failed to send to {d}.{d}.{d}.{d}: {}", .{
+                    const reason: []const u8 = if (err == error.WriteError and self.handle != null)
+                        self.handle.?.lastError()
+                    else
+                        @errorName(err);
+                    log.warn("{s}: failed to send to {d}.{d}.{d}.{d}: {s}", .{
                         self.config.iface_name,
                         client_ip[0],
                         client_ip[1],
                         client_ip[2],
                         client_ip[3],
-                        err,
+                        reason,
                     });
                     continue;
                 };

@@ -358,20 +358,22 @@ pub const Handle = struct {
         }
     }
 
-    /// Inject/send a packet
+    /// Inject/send a packet. On failure callers can call `lastError()` to get
+    /// the libpcap error string (e.g. "send: No route to host").
     pub fn sendPacket(self: *Handle, data: []const u8) Error!void {
         if (!self.activated) return Error.NotActivated;
 
         const ret = pcap_inject(self.handle, data.ptr, data.len);
-        if (ret < 0) {
-            const err_str = pcap_geterr(self.handle);
-            log.err("pcap_inject failed: {s}", .{std.mem.span(err_str)});
-            return Error.WriteError;
-        }
+        if (ret < 0) return Error.WriteError;
 
         if (@as(usize, @intCast(ret)) != data.len) {
             log.warn("pcap_inject: only sent {d} of {d} bytes", .{ ret, data.len });
         }
+    }
+
+    /// Retrieve the last libpcap error string for this handle.
+    pub fn lastError(self: *Handle) []const u8 {
+        return std.mem.span(pcap_geterr(self.handle));
     }
 
     /// Get the link type
