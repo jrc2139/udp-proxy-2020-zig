@@ -567,6 +567,17 @@ pub fn fastPatchEthernetPacket(
     const ipv4: *packet.IPv4Header = @ptrCast(@alignCast(buffer.ptr + packet.ETHERNET_HEADER_SIZE));
     packet.calculateIpChecksum(ipv4);
 
+    // The destination IP changed, and it is covered by the UDP pseudo-header, so
+    // the original UDP checksum is now invalid -- a receiver that validates it
+    // would drop the packet. Zero it (0 disables the optional IPv4 UDP checksum),
+    // matching buildOutgoingPacketInto. Guarded by length since this helper does
+    // not otherwise require a UDP header to be present.
+    const udp_csum_off = packet.ETHERNET_HEADER_SIZE + packet.IPV4_MIN_HEADER_SIZE + 6;
+    if (original.len >= udp_csum_off + 2) {
+        buffer[udp_csum_off] = 0;
+        buffer[udp_csum_off + 1] = 0;
+    }
+
     return buffer[0..original.len];
 }
 
@@ -929,6 +940,38 @@ test "fastPatchEthernetPacket matches buildOutgoingPacketInto" {
     // Both should produce identical output
     try std.testing.expectEqual(full_result.len, fast_result.len);
     try std.testing.expectEqualSlices(u8, full_result, fast_result);
+}
+
+test "fastPatchEthernetPacket zeroes stale UDP checksum after dst-IP rewrite" {
+    // Real mDNS/SSDP/Sonos packets carry a non-zero UDP checksum. The fast path
+    // rewrites the destination IP, which is covered by the UDP pseudo-header, so
+    // the original checksum becomes invalid and receivers would drop the packet.
+    var original: [100]u8 align(4) = undefined;
+    var builder = packet.PacketBuilder.init(&original);
+
+    const src_mac = [_]u8{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55 };
+    const dst_mac = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };
+    _ = try builder.addEthernet(src_mac, dst_mac, .ipv4);
+    const ipv4 = try builder.addIPv4(.{ 192, 168, 1, 1 }, .{ 192, 168, 1, 255 }, .udp, 64);
+    const udp_hdr = try builder.addUDP(9003, 9003);
+    try builder.addPayload("hello world");
+
+    ipv4.setTotalLength(@intCast(packet.IPV4_MIN_HEADER_SIZE + packet.UDP_HEADER_SIZE + 11));
+    udp_hdr.setLength(@intCast(packet.UDP_HEADER_SIZE + 11));
+    // Stamp a non-zero UDP checksum, as a real captured packet would have.
+    udp_hdr.checksum = std.mem.nativeToBig(u16, 0xABCD);
+    packet.calculateIpChecksum(ipv4);
+
+    const pkt_data = builder.getData();
+
+    var buf_fast: [MAX_PACKET_SIZE]u8 align(4) = undefined;
+    const new_src_mac = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x00, 0x01 };
+    const fast = try fastPatchEthernetPacket(&buf_fast, pkt_data, .{ 10, 0, 0, 1 }, new_src_mac);
+
+    // The fast path must zero the now-invalid UDP checksum (0 disables it, which
+    // is valid for IPv4 UDP and matches buildOutgoingPacketInto).
+    const out_udp: *const packet.UdpHeader = @ptrCast(@alignCast(fast.ptr + packet.ETHERNET_HEADER_SIZE + packet.IPV4_MIN_HEADER_SIZE));
+    try std.testing.expectEqual(@as(u16, 0), out_udp.checksum);
 }
 
 test "compact PacketRef is 16 bytes" {
