@@ -471,7 +471,11 @@ pub fn buildOutgoingPacketInto(
         .raw => 0,
         else => return error.UnsupportedLinkType,
     };
-    const ip_header_size = original_ipv4.getHeaderLength();
+    // PacketBuilder.addIPv4 always writes a 20-byte header (IHL=5) and any
+    // source IP options are dropped, so size everything from the 20-byte header.
+    // Using the original (possibly larger) IHL here would make total_length
+    // overstate the bytes actually written.
+    const ip_header_size = packet.IPV4_MIN_HEADER_SIZE;
     const udp_size = packet.UDP_HEADER_SIZE;
     const payload_size = parsed.payload.len;
     const total_size = l2_size + ip_header_size + udp_size + payload_size;
@@ -972,6 +976,44 @@ test "fastPatchEthernetPacket zeroes stale UDP checksum after dst-IP rewrite" {
     // is valid for IPv4 UDP and matches buildOutgoingPacketInto).
     const out_udp: *const packet.UdpHeader = @ptrCast(@alignCast(fast.ptr + packet.ETHERNET_HEADER_SIZE + packet.IPV4_MIN_HEADER_SIZE));
     try std.testing.expectEqual(@as(u16, 0), out_udp.checksum);
+}
+
+test "buildOutgoingPacketInto writes a 20-byte IPv4 header and consistent total_length" {
+    // Hand-craft Ethernet + IPv4(IHL=6, i.e. 4 option bytes) + UDP + 2B payload.
+    // PacketBuilder always writes IHL=5, so the rebuild must drop the options and
+    // report total_length for the 20-byte header it actually emits.
+    var raw: [48]u8 = std.mem.zeroes([48]u8);
+    std.mem.writeInt(u16, raw[12..14], @intFromEnum(packet.EtherType.ipv4), .big);
+    const ip_off = packet.ETHERNET_HEADER_SIZE; // 14
+    raw[ip_off] = (4 << 4) | 6; // version 4, IHL 6 => 24-byte header
+    raw[ip_off + 9] = @intFromEnum(packet.IpProtocol.udp);
+    raw[ip_off + 12] = 192;
+    raw[ip_off + 13] = 168;
+    raw[ip_off + 14] = 1;
+    raw[ip_off + 15] = 1; // src 192.168.1.1
+    raw[ip_off + 16] = 192;
+    raw[ip_off + 17] = 168;
+    raw[ip_off + 18] = 1;
+    raw[ip_off + 19] = 255; // dst 192.168.1.255
+    const udp_off = ip_off + 24; // 38
+    std.mem.writeInt(u16, raw[udp_off..][0..2], 9003, .big);
+    std.mem.writeInt(u16, raw[udp_off + 2 ..][0..2], 9003, .big);
+    std.mem.writeInt(u16, raw[udp_off + 4 ..][0..2], packet.UDP_HEADER_SIZE + 2, .big);
+    raw[udp_off + 8] = 'h';
+    raw[udp_off + 9] = 'i';
+
+    const parsed = try packet.parsePacket(&raw, .ethernet);
+    try std.testing.expectEqual(@as(usize, 24), parsed.ipv4.?.getHeaderLength());
+
+    var out: [MAX_PACKET_SIZE]u8 align(4) = undefined;
+    const result = try buildOutgoingPacketInto(&out, parsed, .{ 10, 0, 0, 1 }, .ethernet, .{ 0, 0, 0, 0, 0, 0 });
+
+    const out_ipv4: *const packet.IPv4Header = @ptrCast(@alignCast(result.ptr + packet.ETHERNET_HEADER_SIZE));
+    try std.testing.expectEqual(@as(u4, 5), out_ipv4.getIHL());
+    try std.testing.expectEqual(
+        @as(u16, packet.IPV4_MIN_HEADER_SIZE + packet.UDP_HEADER_SIZE + 2),
+        out_ipv4.getTotalLength(),
+    );
 }
 
 test "compact PacketRef is 16 bytes" {
