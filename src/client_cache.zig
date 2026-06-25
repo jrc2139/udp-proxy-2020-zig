@@ -133,12 +133,15 @@ pub const ClientCache = struct {
         var to_remove: [64][4]u8 = undefined;
         var remove_count: usize = 0;
 
+        var capped = false;
         var iter = self.clients.iterator();
         while (iter.next()) |entry| {
             if (!entry.value_ptr.is_fixed and entry.value_ptr.expires_at <= now) {
                 if (remove_count < to_remove.len) {
                     to_remove[remove_count] = entry.key_ptr.*;
                     remove_count += 1;
+                } else {
+                    capped = true;
                 }
             }
         }
@@ -146,6 +149,10 @@ pub const ClientCache = struct {
         for (to_remove[0..remove_count]) |ip| {
             log.debug("Removing expired client: {d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] });
             _ = self.clients.remove(ip);
+        }
+
+        if (capped) {
+            log.warn("client cache cleanup hit the {d}-entry cap; remaining expired clients will be removed next cycle", .{to_remove.len});
         }
     }
 
