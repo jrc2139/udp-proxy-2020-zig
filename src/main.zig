@@ -188,6 +188,31 @@ fn deinitLogFile() void {
 }
 
 // ============================================================================
+// Shutdown handling
+// ============================================================================
+
+/// Set by SIGINT/SIGTERM handlers; observed by the main wait loop to trigger a
+/// clean shutdown (stop listeners, join threads, run deinit + leak check).
+var shutdown_requested = std.atomic.Value(bool).init(false);
+
+/// On macOS the C signal handler takes the SIG enum; elsewhere it is c_int.
+const SigArg = if (builtin.os.tag.isDarwin()) std.posix.SIG else c_int;
+
+fn handleShutdownSignal(_: SigArg) callconv(.c) void {
+    shutdown_requested.store(true, .release);
+}
+
+fn installSignalHandlers() void {
+    var act = std.posix.Sigaction{
+        .handler = .{ .handler = handleShutdownSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.INT, &act, null);
+    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -432,10 +457,17 @@ fn runWithThreads(
         try threads.append(allocator, thread);
     }
 
-    // Wait for all threads (they run forever unless stopped)
-    for (threads.items) |thread| {
-        thread.join();
+    // Install signal handlers and block until a shutdown signal arrives. The
+    // listener threads are joined by the deferred cleanup once stop() makes them
+    // observe the change and exit; that cleanup also runs feed/listener/sink
+    // deinit and the GPA leak check, which were previously unreachable.
+    installSignalHandlers();
+    while (!shutdown_requested.load(.acquire)) {
+        const req = std.c.timespec{ .sec = 0, .nsec = 200 * std.time.ns_per_ms }; // 200ms
+        _ = std.c.nanosleep(&req, null);
     }
+    log.info("Shutdown requested; stopping listeners and cleaning up...", .{});
+    for (listeners.items) |*l| l.stop();
 }
 
 fn runListener(listener: *Listener, feed: *sender.SendPktFeed) void {

@@ -83,8 +83,9 @@ pub const Listener = struct {
     in_dumper: ?pcap.Dumper,
     /// Pcap dumper for outgoing packets
     out_dumper: ?pcap.Dumper,
-    /// Running flag
-    running: bool,
+    /// Running flag (atomic: set false by stop()/deinit from another thread,
+    /// read by the listener thread's run loop).
+    running: std.atomic.Value(bool),
 
     /// Initialize a new listener
     pub fn init(allocator: std.mem.Allocator, config: ListenerConfig) !Listener {
@@ -102,7 +103,7 @@ pub const Listener = struct {
             .outgoing_pool = sender.OutgoingPool.init(),
             .in_dumper = null,
             .out_dumper = null,
-            .running = false,
+            .running = std.atomic.Value(bool).init(false),
         };
         // If any fallible step below fails, the HashMap backing storage
         // allocated by addFixed must be released, else we leak it.
@@ -122,7 +123,7 @@ pub const Listener = struct {
 
     /// Deinitialize the listener
     pub fn deinit(self: *Listener) void {
-        self.running = false;
+        self.running.store(false, .release);
 
         if (self.in_dumper) |*d| {
             d.close();
@@ -266,7 +267,7 @@ pub const Listener = struct {
 
     /// Main packet handling loop (zero-copy version, thread mode)
     pub fn run(self: *Listener, feed: *sender.SendPktFeed) void {
-        self.running = true;
+        self.running.store(true, .release);
 
         // Set non-blocking mode for normal (non-send-only) listeners
         // so we can interleave pcap capture with ref channel draining
@@ -287,7 +288,7 @@ pub const Listener = struct {
 
         log.debug("{s}: starting packet handler (send_only={})", .{ self.config.iface_name, self.config.send_only });
 
-        while (self.running) {
+        while (self.running.load(.acquire)) {
             if (self.config.send_only) {
                 // Send-only mode: block on channel, no pcap capture
                 if (self.ref_channel) |channel| {
@@ -540,7 +541,7 @@ pub const Listener = struct {
 
     /// Stop the listener
     pub fn stop(self: *Listener) void {
-        self.running = false;
+        self.running.store(false, .release);
         if (self.ref_channel) |channel| {
             channel.close();
         }
@@ -653,4 +654,41 @@ test "Listener.init tripwires clean up on failure at every point" {
         );
     }
     init_tw.reset();
+}
+
+test "Listener.run exits promptly when stopped" {
+    const allocator = std.testing.allocator;
+    var feed = try sender.SendPktFeed.init(allocator);
+    defer feed.deinit();
+
+    const config = ListenerConfig{
+        .iface_name = "lo",
+        .ports = &[_]u16{9003},
+        .timeout_ms = 100,
+        .cache_ttl_minutes = 5,
+        .fixed_ips = &[_][4]u8{},
+        .promisc = false,
+        .send_only = false,
+        .pcap_debug = false,
+        .pcap_path = "",
+    };
+    var listener = try Listener.init(allocator, config);
+    defer listener.deinit();
+    // No open() -> the pcap handle stays null, so run() just idles checking the
+    // `running` flag each iteration.
+
+    const Runner = struct {
+        fn go(l: *Listener, f: *sender.SendPktFeed) void {
+            l.run(f);
+        }
+    };
+    var thread = try std.Thread.spawn(.{}, Runner.go, .{ &listener, &feed });
+
+    // Let the loop start, then request shutdown. join() returns only if run()
+    // observed the stop and exited -- otherwise this test hangs, which is the
+    // failure signal.
+    const ns = std.c.timespec{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+    _ = std.c.nanosleep(&ns, null);
+    listener.stop();
+    thread.join();
 }
