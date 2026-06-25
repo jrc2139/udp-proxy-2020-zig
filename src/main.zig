@@ -496,6 +496,10 @@ fn parseArgs(allocator: std.mem.Allocator, args: *Args, proc_args: std.process.A
             // Handle comma-separated interfaces
             var iface_iter = std.mem.splitScalar(u8, value, ',');
             while (iface_iter.next()) |iface| {
+                if (iface.len == 0) {
+                    log.err("Empty interface name in --interface '{s}'", .{value});
+                    return error.InvalidInterface;
+                }
                 const iface_z = try allocator.allocSentinel(u8, iface.len, 0);
                 @memcpy(iface_z, iface);
                 try args.interfaces.append(allocator, iface_z);
@@ -529,13 +533,22 @@ fn parseArgs(allocator: std.mem.Allocator, args: *Args, proc_args: std.process.A
                 log.err("Invalid port number: {s}", .{value});
                 return error.InvalidPort;
             };
+            if (port == 0) {
+                log.err("Invalid port number: 0 (ports are 1-65535)", .{});
+                return error.InvalidPort;
+            }
             try args.ports.append(allocator, port);
         } else if (std.mem.eql(u8, arg, "-t") or std.mem.eql(u8, arg, "--timeout")) {
             const value = arg_iter.next() orelse return error.MissingValue;
-            args.timeout_ms = std.fmt.parseInt(i32, value, 10) catch {
+            const timeout = std.fmt.parseInt(i32, value, 10) catch {
                 log.err("Invalid timeout: {s}", .{value});
                 return error.InvalidTimeout;
             };
+            if (timeout < 0) {
+                log.err("Invalid timeout (must be >= 0): {s}", .{value});
+                return error.InvalidTimeout;
+            }
+            args.timeout_ms = timeout;
         } else if (std.mem.eql(u8, arg, "-T") or std.mem.eql(u8, arg, "--cache-ttl")) {
             const value = arg_iter.next() orelse return error.MissingValue;
             args.cache_ttl = std.fmt.parseInt(u32, value, 10) catch {
