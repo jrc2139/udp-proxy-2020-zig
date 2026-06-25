@@ -182,10 +182,9 @@ fn deinitLogFile() void {
 /// clean shutdown (stop listeners, join threads, run deinit + leak check).
 var shutdown_requested = std.atomic.Value(bool).init(false);
 
-/// On macOS the C signal handler takes the SIG enum; elsewhere it is c_int.
-const SigArg = if (builtin.os.tag.isDarwin()) std.posix.SIG else c_int;
-
-fn handleShutdownSignal(_: SigArg) callconv(.c) void {
+/// The C signal handler takes the platform's SIG enum (macOS, FreeBSD, Linux
+/// all model it as an enum in Zig 0.16).
+fn handleShutdownSignal(_: std.posix.SIG) callconv(.c) void {
     shutdown_requested.store(true, .release);
 }
 
