@@ -420,7 +420,11 @@ pub const Listener = struct {
         const ipv4: *const packet.IPv4Header = @ptrCast(@alignCast(pkt_data.ptr + ref.l2_size));
         const udp: *const packet.UdpHeader = @ptrCast(@alignCast(pkt_data.ptr + ref.l2_size + ref.ip_header_len));
         const payload_start = @as(usize, ref.l2_size) + ref.ip_header_len + packet.UDP_HEADER_SIZE;
-        const payload = if (payload_start < pkt_data.len) pkt_data[payload_start..] else &[_]u8{};
+        // Trim to the UDP length field so Ethernet padding is not forwarded as
+        // payload (the rebuild path recomputes lengths from this slice). The
+        // min_len check above guarantees payload_start <= pkt_data.len.
+        const payload_len = packet.udpPayloadLen(udp.getLength(), pkt_data.len - payload_start);
+        const payload = pkt_data[payload_start .. payload_start + payload_len];
 
         const parsed = packet.ParsedPacket{
             .link_type = sender.idxToLinkType(ref.link_type_idx),
