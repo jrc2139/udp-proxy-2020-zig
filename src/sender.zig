@@ -178,11 +178,12 @@ pub const MpscRefQueue = struct {
 
     items: [QUEUE_SIZE]PacketRef,
     sequence: [QUEUE_SIZE]std.atomic.Value(u32),
-    write_pos: std.atomic.Value(u32),
-    // Cache-line padding: prevent false sharing between producer (write_pos)
-    // and consumer (read_pos) which would cause cache-line bouncing.
-    _cache_pad: [60]u8 = undefined,
-    read_pos: u32, // only consumer touches this
+    // Align the producer (write_pos) and consumer (read_pos) cursors to separate
+    // cache lines to avoid false sharing. The previous fixed 60-byte pad only
+    // isolated them if the whole queue happened to be cache-line aligned, which
+    // the struct's u32 alignment did not guarantee.
+    write_pos: std.atomic.Value(u32) align(std.atomic.cache_line),
+    read_pos: u32 align(std.atomic.cache_line), // only consumer touches this
 
     pub fn init() MpscRefQueue {
         var self: MpscRefQueue = undefined;
