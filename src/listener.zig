@@ -187,6 +187,17 @@ pub const Listener = struct {
             return error.UnsupportedLinkType;
         }
 
+        // Resolve the interface MAC to use as the source MAC of forwarded
+        // Ethernet frames; an all-zero source MAC can be dropped by switches.
+        if (pcap.getInterfaceMac(self.config.iface_name)) |mac| {
+            self.hw_addr = mac;
+            log.debug("{s}: source MAC {x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
+                self.config.iface_name, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+            });
+        } else if (self.link_type == .ethernet) {
+            log.warn("{s}: could not resolve interface MAC; forwarded frames will use a zero source MAC", .{self.config.iface_name});
+        }
+
         // Set BPF filter -- use port-only filter for interfaces without addresses (e.g., enc0)
         const filter = if (iface.addresses.len > 0)
             try bpf.buildFilter(self.allocator, self.config.ports, iface.addresses)
