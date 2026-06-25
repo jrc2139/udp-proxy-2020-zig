@@ -652,13 +652,6 @@ pub fn getInterfaceMac(iface_name: []const u8) ?[6]u8 {
 // Utility Functions
 // ============================================================================
 
-/// Format an IPv4 address as a string
-pub fn formatIpv4(addr: [4]u8) [15:0]u8 {
-    var buf: [15:0]u8 = undefined;
-    _ = std.fmt.bufPrint(&buf, "{d}.{d}.{d}.{d}", .{ addr[0], addr[1], addr[2], addr[3] }) catch unreachable;
-    return buf;
-}
-
 /// Parse an IPv4 address string
 pub fn parseIpv4(str: []const u8) ?[4]u8 {
     var result: [4]u8 = undefined;

@@ -36,7 +36,6 @@ pub const findAllDevices = pcap.findAllDevices;
 pub const freeDevices = pcap.freeDevices;
 pub const findLoopback = pcap.findLoopback;
 pub const parseIpv4 = pcap.parseIpv4;
-pub const formatIpv4 = pcap.formatIpv4;
 
 pub const parsePacket = packet.parsePacket;
 pub const calculateIpChecksum = packet.calculateIpChecksum;
