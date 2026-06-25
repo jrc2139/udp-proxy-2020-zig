@@ -30,6 +30,11 @@ fn milliTimestamp() i64 {
     return @as(i64, ts.sec) * 1000 + @divTrunc(ts.nsec, std.time.ns_per_ms);
 }
 
+/// Stop a listener after this many consecutive pcap capture errors (~5s at the
+/// 1ms idle poll). A persistent error (e.g. the interface went down) is fatal
+/// for that handle, so escalate to a visible err log + stop rather than spin.
+const MAX_CONSECUTIVE_CAPTURE_ERRORS = 5000;
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -288,6 +293,9 @@ pub const Listener = struct {
 
         log.debug("{s}: starting packet handler (send_only={})", .{ self.config.iface_name, self.config.send_only });
 
+        // Consecutive pcap capture errors; reset on any healthy read.
+        var capture_errors: u32 = 0;
+
         while (self.running.load(.acquire)) {
             if (self.config.send_only) {
                 // Send-only mode: block on channel, no pcap capture
@@ -324,13 +332,21 @@ pub const Listener = struct {
                 if (self.handle) |*handle| {
                     while (true) {
                         if (handle.nextPacket()) |result| {
+                            capture_errors = 0; // healthy read (a packet, or empty)
                             if (result) |pkt_data| {
                                 self.handleIncomingPacket(pkt_data.data, pkt_data.info, feed);
                                 did_work = true;
                             } else break; // no more packets available
                         } else |err| {
-                            if (err != pcap.Error.NoMorePackets) {
-                                log.warn("{s}: capture error: {}", .{ self.config.iface_name, err });
+                            if (err == pcap.Error.NoMorePackets) break;
+                            capture_errors += 1;
+                            // Log sparsely to avoid flooding on a broken interface.
+                            if (capture_errors == 1 or capture_errors % 1000 == 0) {
+                                log.warn("{s}: capture error ({d} in a row): {}", .{ self.config.iface_name, capture_errors, err });
+                            }
+                            if (capture_errors >= MAX_CONSECUTIVE_CAPTURE_ERRORS) {
+                                log.err("{s}: capture failing persistently after {d} consecutive errors; stopping this interface's listener", .{ self.config.iface_name, capture_errors });
+                                self.running.store(false, .release);
                             }
                             break;
                         }
