@@ -394,9 +394,17 @@ pub const Listener = struct {
     /// Send packets from a packet reference (zero-copy version).
     /// Uses pre-computed header offsets from PacketRef to skip re-parsing.
     fn sendPacketsFromRef(self: *Listener, ref: sender.PacketRef) !void {
-        // Get packet data from the shared ring buffer
+        // Copy the packet out of the shared ring ONCE into a private buffer,
+        // validating the slot was not recycled by a faster producer. After this
+        // point all work is on the private copy, so the ring is never re-read.
+        // align(4): the header pointer casts below require >=2-byte alignment;
+        // a stack [N]u8 would otherwise default to align 1.
+        var scratch: [sender.MAX_PACKET_SIZE]u8 align(4) = undefined;
         const pkt_data = if (self.feed) |feed|
-            feed.getPacketData(ref.ring_idx)
+            (feed.copyPacket(ref.seq, &scratch) orelse {
+                log.debug("{s}: dropped packet: ring slot recycled before forward (seq={d})", .{ self.config.iface_name, ref.seq });
+                return;
+            })
         else
             return error.NoFeed;
 
@@ -475,7 +483,7 @@ pub const Listener = struct {
             ref.ip_header_len == packet.IPV4_MIN_HEADER_SIZE) // standard IPv4, no options
             try sender.fastPatchEthernetPacket(
                 buffer,
-                self.feed.?.getPacketData(ref.ring_idx),
+                parsed.raw_data,
                 dst_ip,
                 self.hw_addr,
             )

@@ -50,42 +50,77 @@ pub const RING_SIZE = 256;
 
 /// Pre-allocated ring buffer for packet data.
 /// Stores packets in fixed slots, eliminating per-packet allocation.
+///
+/// Slot lifetime safety: the ring is shared by all producers, and a captured
+/// packet's slot can be recycled (overwritten) while a lagging consumer still
+/// holds a reference to it. Each slot therefore carries a generation stamp
+/// (`seqs`). A consumer copies the bytes out and verifies (seqlock) that the
+/// slot still held its packet before and after the copy; a mismatch means the
+/// slot was recycled, so the consumer drops the packet instead of forwarding
+/// corrupt data.
 pub const PacketRing = struct {
+    /// Top bit of a stamp marks "write in progress"; the low 31 bits are the
+    /// store sequence number. A consumer's seq never has the top bit set, so a
+    /// slot that is mid-write never compares equal to a held seq.
+    const WRITING_BIT: u32 = 0x8000_0000;
+    const SEQ_MASK: u32 = 0x7FFF_FFFF;
+
     buffers: [RING_SIZE][MAX_PACKET_SIZE]u8,
     lengths: [RING_SIZE]u16,
+    /// Per-slot generation stamp (see WRITING_BIT / SEQ_MASK).
+    seqs: [RING_SIZE]std.atomic.Value(u32),
     write_idx: std.atomic.Value(u32),
 
     pub fn init() PacketRing {
-        return PacketRing{
+        var self = PacketRing{
             .buffers = undefined,
             .lengths = [_]u16{0} ** RING_SIZE,
+            .seqs = undefined,
             .write_idx = std.atomic.Value(u32).init(0),
         };
+        for (0..RING_SIZE) |i| self.seqs[i] = std.atomic.Value(u32).init(0);
+        return self;
     }
 
-    /// Store packet data and return the slot index.
-    /// Thread-safe via atomic increment. The non-atomic memcpy/length writes
-    /// are ordered by the sequence store (release) in MpscRefQueue.push(),
-    /// which the consumer observes via sequence load (acquire) in pop().
-    pub fn store(self: *PacketRing, data: []const u8) u8 {
-        const idx = self.write_idx.fetchAdd(1, .monotonic) % RING_SIZE;
+    /// Store packet data and return its unique sequence number, which also
+    /// encodes the slot (`seq % RING_SIZE`). The slot's stamp is set to WRITING
+    /// before the copy and to `seq` after, so a consumer holding a previous seq
+    /// for the same slot detects the overwrite in `copyOut`.
+    pub fn store(self: *PacketRing, data: []const u8) u32 {
+        const raw = self.write_idx.fetchAdd(1, .monotonic);
+        const seq = raw & SEQ_MASK;
+        const idx = raw % RING_SIZE;
         const len: u16 = @intCast(@min(data.len, MAX_PACKET_SIZE));
+        self.seqs[idx].store(seq | WRITING_BIT, .release);
         @memcpy(self.buffers[idx][0..len], data[0..len]);
         self.lengths[idx] = len;
-        return @intCast(idx);
+        self.seqs[idx].store(seq, .release);
+        return seq;
     }
 
-    /// Get packet data from a slot.
-    pub fn get(self: *const PacketRing, idx: u8) []const u8 {
-        return self.buffers[idx][0..self.lengths[idx]];
+    /// Copy the packet identified by `seq` into `dst`, validating (seqlock)
+    /// that the slot still holds that store before and after the copy. Returns
+    /// the copied slice, or null if the slot was recycled/overwritten -- the
+    /// caller must then drop the packet. `dst` should be at least
+    /// MAX_PACKET_SIZE; the copy is clamped to `dst.len` regardless.
+    pub fn copyOut(self: *const PacketRing, seq: u32, dst: []u8) ?[]const u8 {
+        const idx = seq % RING_SIZE;
+        if (self.seqs[idx].load(.acquire) != seq) return null;
+        const len = @min(@as(usize, self.lengths[idx]), @min(dst.len, MAX_PACKET_SIZE));
+        @memcpy(dst[0..len], self.buffers[idx][0..len]);
+        // Re-validate: an overwrite concurrent with the copy may have torn the
+        // bytes, so discard them if the slot no longer holds our seq.
+        if (self.seqs[idx].load(.acquire) != seq) return null;
+        return dst[0..len];
     }
 };
 
 /// Lightweight packet reference - passed through channels instead of full packet data.
 /// 16 bytes: fits in half a cache line. MpscRefQueue items fit in L1 cache (4KB).
 pub const PacketRef = struct {
-    /// Index into the shared ring buffer
-    ring_idx: u8,
+    /// Ring store sequence number; also encodes the slot (`seq % RING_SIZE`).
+    /// The consumer validates the slot still holds this seq before forwarding.
+    seq: u32,
     /// Compact link type index (0=ethernet, 1=null, 2=loop, 3=enc, 4=raw)
     link_type_idx: u8,
     /// Source interface index (into SendPktFeed.iface_channels)
@@ -94,7 +129,6 @@ pub const PacketRef = struct {
     l2_size: u8,
     /// IPv4 header length in bytes (usually 20)
     ip_header_len: u8,
-    _pad: [3]u8 = .{ 0, 0, 0 },
     /// Capture timestamp in microseconds since epoch
     timestamp_us: i64,
 };
@@ -336,9 +370,10 @@ pub const SendPktFeed = struct {
         return .{ .channel = channel, .idx = idx };
     }
 
-    /// Get packet data from the shared ring buffer
-    pub fn getPacketData(self: *const SendPktFeed, ring_idx: u8) []const u8 {
-        return self.ring.get(ring_idx);
+    /// Copy the packet for `seq` out of the shared ring into `dst`, validating
+    /// the slot was not recycled. Returns null if the consumer must drop it.
+    pub fn copyPacket(self: *const SendPktFeed, seq: u32, dst: []u8) ?[]const u8 {
+        return self.ring.copyOut(seq, dst);
     }
 
     /// Broadcast a packet to all interfaces except the source (zero-copy).
@@ -358,11 +393,11 @@ pub const SendPktFeed = struct {
         }
 
         // Store packet data in ring buffer (one copy)
-        const ring_idx = self.ring.store(data);
+        const seq = self.ring.store(data);
 
         // Create compact ref (16 bytes)
         const ref = PacketRef{
-            .ring_idx = ring_idx,
+            .seq = seq,
             .link_type_idx = linkTypeToIdx(link_type),
             .src_iface_idx = src_iface_idx,
             .l2_size = l2_size,
@@ -557,10 +592,28 @@ test "PacketRing store and retrieve" {
     var ring = PacketRing.init();
     const data = "Hello, World!";
 
-    const idx = ring.store(data);
-    const retrieved = ring.get(idx);
+    const seq = ring.store(data);
+    var buf: [MAX_PACKET_SIZE]u8 = undefined;
+    const retrieved = ring.copyOut(seq, &buf).?;
 
     try std.testing.expectEqualStrings(data, retrieved);
+}
+
+test "PacketRing.copyOut detects slot recycling" {
+    var ring = PacketRing.init();
+    var buf: [MAX_PACKET_SIZE]u8 = undefined;
+
+    const seq_a = ring.store("packet A");
+    // Valid immediately after store.
+    try std.testing.expectEqualStrings("packet A", ring.copyOut(seq_a, &buf).?);
+
+    // Overwrite the same slot RING_SIZE times so seq_a's slot is recycled.
+    for (0..RING_SIZE) |_| {
+        _ = ring.store("newer packet");
+    }
+
+    // seq_a's slot now holds a newer store -> copyOut must drop (null).
+    try std.testing.expect(ring.copyOut(seq_a, &buf) == null);
 }
 
 test "OutgoingPool round-robin" {
@@ -579,7 +632,7 @@ test "OutgoingPool round-robin" {
 
 fn makeRef(idx: u8) PacketRef {
     return PacketRef{
-        .ring_idx = idx,
+        .seq = idx,
         .link_type_idx = 0, // ethernet
         .src_iface_idx = 0,
         .l2_size = 14,
@@ -597,9 +650,9 @@ test "MpscRefQueue: single-threaded push and pop" {
     try std.testing.expect(q.push(makeRef(2)));
     try std.testing.expect(q.push(makeRef(3)));
 
-    try std.testing.expectEqual(@as(u8, 1), q.pop().?.ring_idx);
-    try std.testing.expectEqual(@as(u8, 2), q.pop().?.ring_idx);
-    try std.testing.expectEqual(@as(u8, 3), q.pop().?.ring_idx);
+    try std.testing.expectEqual(@as(u32, 1), q.pop().?.seq);
+    try std.testing.expectEqual(@as(u32, 2), q.pop().?.seq);
+    try std.testing.expectEqual(@as(u32, 3), q.pop().?.seq);
     try std.testing.expect(q.pop() == null); // drained
 }
 
@@ -626,7 +679,7 @@ test "MpscRefQueue: wrap-around correctness" {
     for (0..MpscRefQueue.QUEUE_SIZE * 3) |i| {
         try std.testing.expect(q.push(makeRef(@intCast(i & 0xFF))));
         const ref = q.pop().?;
-        try std.testing.expectEqual(@as(u8, @intCast(i & 0xFF)), ref.ring_idx);
+        try std.testing.expectEqual(@as(u32, @intCast(i & 0xFF)), ref.seq);
     }
 
     try std.testing.expect(q.isEmpty());
@@ -687,7 +740,7 @@ test "MpscRefQueue: MPSC stress test" {
 
     while (total < expected_total) {
         if (q.pop()) |ref| {
-            counts[ref.ring_idx] += 1;
+            counts[ref.seq] += 1;
             total += 1;
         } else {
             std.atomic.spinLoopHint();
@@ -715,8 +768,8 @@ test "RefChannel: send and tryReceive" {
     try ch.send(makeRef(10));
     try ch.send(makeRef(20));
 
-    try std.testing.expectEqual(@as(u8, 10), ch.tryReceive().?.ring_idx);
-    try std.testing.expectEqual(@as(u8, 20), ch.tryReceive().?.ring_idx);
+    try std.testing.expectEqual(@as(u32, 10), ch.tryReceive().?.seq);
+    try std.testing.expectEqual(@as(u32, 20), ch.tryReceive().?.seq);
     try std.testing.expect(ch.tryReceive() == null);
 }
 
@@ -738,7 +791,7 @@ test "RefChannel: receive drains on close" {
     // Should still get the queued item
     const ref = ch.receive();
     try std.testing.expect(ref != null);
-    try std.testing.expectEqual(@as(u8, 42), ref.?.ring_idx);
+    try std.testing.expectEqual(@as(u32, 42), ref.?.seq);
 
     // Now should get null (closed + empty)
     try std.testing.expect(ch.receive() == null);
@@ -781,7 +834,7 @@ test "RefChannel: MPSC concurrent send + tryReceive" {
 
     while (total < expected) {
         if (ch.tryReceive()) |ref| {
-            counts[ref.ring_idx] += 1;
+            counts[ref.seq] += 1;
             total += 1;
         } else {
             std.atomic.spinLoopHint();
