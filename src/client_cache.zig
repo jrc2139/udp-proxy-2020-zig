@@ -12,6 +12,13 @@ const std = @import("std");
 
 const log = std.log.scoped(.client_cache);
 
+/// Valid `Io` backing the contended (futex) path of `mutex`. The Threaded
+/// futex ops ignore userdata, so the process-wide instance is a correct
+/// source; passing `undefined` would crash on lock contention.
+inline fn syncIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
 /// Return milliseconds since Unix epoch using POSIX clock_gettime.
 fn milliTimestamp() i64 {
     var ts: std.posix.timespec = undefined;
@@ -63,15 +70,15 @@ pub const ClientCache = struct {
 
     /// Deinitialize the cache
     pub fn deinit(self: *ClientCache) void {
-        self.mutex.lockUncancelable(undefined);
-        defer self.mutex.unlock(undefined);
+        self.mutex.lockUncancelable(syncIo());
+        defer self.mutex.unlock(syncIo());
         self.clients.deinit();
     }
 
     /// Add a fixed IP that never expires
     pub fn addFixed(self: *ClientCache, ip: [4]u8) !void {
-        self.mutex.lockUncancelable(undefined);
-        defer self.mutex.unlock(undefined);
+        self.mutex.lockUncancelable(syncIo());
+        defer self.mutex.unlock(syncIo());
 
         // Check if already exists as fixed
         if (self.clients.get(ip)) |existing| {
@@ -90,8 +97,8 @@ pub const ClientCache = struct {
 
     /// Learn a client IP (update TTL if exists)
     pub fn learn(self: *ClientCache, ip: [4]u8) !void {
-        self.mutex.lockUncancelable(undefined);
-        defer self.mutex.unlock(undefined);
+        self.mutex.lockUncancelable(syncIo());
+        defer self.mutex.unlock(syncIo());
 
         const now = milliTimestamp();
         const expires_at: i64 = now + self.ttl_ms;
@@ -142,8 +149,8 @@ pub const ClientCache = struct {
 
     /// Remove expired entries using stack-allocated collection (no heap allocation).
     pub fn cleanup(self: *ClientCache) void {
-        self.mutex.lockUncancelable(undefined);
-        defer self.mutex.unlock(undefined);
+        self.mutex.lockUncancelable(syncIo());
+        defer self.mutex.unlock(syncIo());
 
         const now = milliTimestamp();
 
@@ -171,15 +178,15 @@ pub const ClientCache = struct {
 
     /// Get the number of clients (including expired)
     pub fn count(self: *ClientCache) usize {
-        self.mutex.lockUncancelable(undefined);
-        defer self.mutex.unlock(undefined);
+        self.mutex.lockUncancelable(syncIo());
+        defer self.mutex.unlock(syncIo());
         return self.clients.count();
     }
 
     /// Check if a client exists
     pub fn contains(self: *ClientCache, ip: [4]u8) bool {
-        self.mutex.lockUncancelable(undefined);
-        defer self.mutex.unlock(undefined);
+        self.mutex.lockUncancelable(syncIo());
+        defer self.mutex.unlock(syncIo());
 
         if (self.clients.get(ip)) |entry| {
             if (entry.is_fixed) return true;

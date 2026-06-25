@@ -87,6 +87,15 @@ var log_file: ?std.Io.File = null;
 var log_mutex: std.Io.Mutex = std.Io.Mutex.init;
 const default_log_path = "/tmp/udp-proxy-2020.log";
 
+/// A valid `Io` whose futex backs the contended path of the cross-thread
+/// mutexes. The `Threaded` futex ops ignore `userdata` and call real OS
+/// futexes, so the process-wide instance supplies a correct vtable. Passing
+/// `undefined` here (the previous code) dereferenced a garbage vtable the
+/// moment a lock was contended -> crash under concurrent logging.
+pub inline fn syncIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
 fn customLog(
     comptime level: std.log.Level,
     comptime scope: @TypeOf(.enum_literal),
@@ -132,8 +141,8 @@ fn customLog(
     } ++ args) catch return;
 
     // Lock for thread safety and write atomically
-    log_mutex.lockUncancelable(undefined);
-    defer log_mutex.unlock(undefined);
+    log_mutex.lockUncancelable(syncIo());
+    defer log_mutex.unlock(syncIo());
 
     // Write via POSIX fd to avoid requiring io (std.Io.File.write requires io).
     // Loop over partial writes so we don't drop the trailing '\n' and cause

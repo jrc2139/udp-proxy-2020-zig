@@ -21,6 +21,13 @@ const tripwire = @import("tripwire");
 
 const log = std.log.scoped(.sender);
 
+/// Valid `Io` backing the contended (futex) path of `reg_mutex`. The Threaded
+/// futex ops ignore userdata, so the process-wide instance is a correct
+/// source; passing `undefined` would crash on lock contention.
+inline fn syncIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
 /// Tripwire points for SendPktFeed.init. Test-only; inlined to no-ops in
 /// release builds via tripwire.enabled = builtin.is_test.
 pub const feed_init_tw = tripwire.module(enum {
@@ -303,8 +310,8 @@ pub const SendPktFeed = struct {
 
     /// Register a ref channel for an interface. Returns the interface index.
     pub fn registerSender(self: *SendPktFeed, iface_name: []const u8) !struct { channel: *RefChannel, idx: u8 } {
-        self.reg_mutex.lockUncancelable(undefined);
-        defer self.reg_mutex.unlock(undefined);
+        self.reg_mutex.lockUncancelable(syncIo());
+        defer self.reg_mutex.unlock(syncIo());
 
         if (self.iface_count >= MAX_IFACES) {
             log.err("Too many interfaces (max {d})", .{MAX_IFACES});
