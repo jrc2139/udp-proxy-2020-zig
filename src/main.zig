@@ -156,27 +156,14 @@ fn customLog(
     }
 }
 
-fn initLogFile(path: ?[]const u8) !void {
-    const log_path = path orelse default_log_path;
-    var path_buf: [512]u8 = undefined;
-    const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{log_path}) catch return error.PathTooLong;
-    const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0o644));
-    if (fd < 0) return error.FileNotFound;
-    _ = std.c.lseek(fd, 0, std.posix.SEEK.END);
-    log_file = std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
-}
-
 fn initLogFileCreate(path: ?[]const u8) !void {
     const log_path = path orelse default_log_path;
     var path_buf: [512]u8 = undefined;
     const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{log_path}) catch return error.PathTooLong;
-    var fd = std.c.open(path_z.ptr, .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0o644));
-    if (fd < 0) {
-        fd = std.c.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
-        if (fd < 0) return error.OpenFailed;
-    } else {
-        _ = std.c.lseek(fd, 0, std.posix.SEEK.END);
-    }
+    // O_APPEND gives atomic appends (no lseek race) and CREAT without TRUNC
+    // appends to an existing log rather than clobbering it.
+    const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, @as(std.c.mode_t, 0o644));
+    if (fd < 0) return error.OpenFailed;
     log_file = std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
 }
 
