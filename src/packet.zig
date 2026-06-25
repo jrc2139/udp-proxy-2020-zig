@@ -276,7 +276,9 @@ pub fn parsePacket(data: []const u8, link_type: pcap.LinkType) ParseError!Parsed
             result.ethernet = eth;
             offset = ETHERNET_HEADER_SIZE;
 
-            // Check ether type
+            // Only IPv4 is forwarded. VLAN-tagged (0x8100) and IPv6 (0x86DD)
+            // frames are intentionally unsupported and dropped here; the caller
+            // logs the parse failure at debug level.
             if (eth.getEtherType() != .ipv4) {
                 return ParseError.UnsupportedEtherType;
             }
