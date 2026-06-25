@@ -371,6 +371,7 @@ pub const Listener = struct {
             const now = milliTimestamp();
             if (now - last_cleanup > cleanup_interval) {
                 self.client_cache.cleanup();
+                feed.maybeLogStats(now, cleanup_interval);
                 last_cleanup = now;
             }
         }
@@ -430,6 +431,7 @@ pub const Listener = struct {
         var scratch: [sender.MAX_PACKET_SIZE]u8 align(4) = undefined;
         const pkt_data = if (self.feed) |feed|
             (feed.copyPacket(ref.seq, &scratch) orelse {
+                feed.recordRecycledDrop();
                 log.debug("{s}: dropped packet: ring slot recycled before forward (seq={d})", .{ self.config.iface_name, ref.seq });
                 return;
             })

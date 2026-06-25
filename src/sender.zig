@@ -311,6 +311,12 @@ pub const SendPktFeed = struct {
     allocator: std.mem.Allocator,
     /// Mutex for registration (not used in hot path)
     reg_mutex: std.Io.Mutex,
+    /// Drop counters (atomic; incremented from any producer thread).
+    stats_queue_full: std.atomic.Value(u64),
+    stats_too_large: std.atomic.Value(u64),
+    stats_recycled: std.atomic.Value(u64),
+    /// Last drop-summary log time (ms since epoch) for rate-limiting.
+    stats_last_log_ms: std.atomic.Value(i64),
 
     pub fn init(allocator: std.mem.Allocator) !SendPktFeed {
         const ring = try allocator.create(PacketRing);
@@ -324,6 +330,10 @@ pub const SendPktFeed = struct {
             .ring = ring,
             .allocator = allocator,
             .reg_mutex = std.Io.Mutex.init,
+            .stats_queue_full = std.atomic.Value(u64).init(0),
+            .stats_too_large = std.atomic.Value(u64).init(0),
+            .stats_recycled = std.atomic.Value(u64).init(0),
+            .stats_last_log_ms = std.atomic.Value(i64).init(0),
         };
     }
 
@@ -388,7 +398,7 @@ pub const SendPktFeed = struct {
         timestamp_us: i64,
     ) void {
         if (data.len > MAX_PACKET_SIZE) {
-            log.warn("Packet too large to broadcast: {d} bytes", .{data.len});
+            _ = self.stats_too_large.fetchAdd(1, .monotonic);
             return;
         }
 
@@ -408,10 +418,34 @@ pub const SendPktFeed = struct {
         // Iterate frozen array -- no lock needed, array is immutable after startup
         for (0..self.iface_count) |i| {
             if (i == src_iface_idx) continue;
-            self.iface_channels[i].send(ref) catch |err| {
-                log.warn("Failed to send ref to iface {d}: {}", .{ i, err });
+            self.iface_channels[i].send(ref) catch {
+                // Destination queue full (consumer overloaded). Count rather than
+                // log per-event; broadcast is the hot path and would flood.
+                _ = self.stats_queue_full.fetchAdd(1, .monotonic);
             };
         }
+    }
+
+    /// Record a packet dropped because its ring slot was recycled before the
+    /// consumer could read it (an overload indicator).
+    pub fn recordRecycledDrop(self: *SendPktFeed) void {
+        _ = self.stats_recycled.fetchAdd(1, .monotonic);
+    }
+
+    /// Log a one-line drop summary at most once per `interval_ms`, and only when
+    /// there is something to report. Safe to call from every listener thread;
+    /// the CAS ensures a single emitter per interval.
+    pub fn maybeLogStats(self: *SendPktFeed, now_ms: i64, interval_ms: i64) void {
+        const qf = self.stats_queue_full.load(.monotonic);
+        const tl = self.stats_too_large.load(.monotonic);
+        const rc = self.stats_recycled.load(.monotonic);
+        if (qf == 0 and tl == 0 and rc == 0) return;
+
+        const last = self.stats_last_log_ms.load(.monotonic);
+        if (now_ms - last < interval_ms) return;
+        if (self.stats_last_log_ms.cmpxchgStrong(last, now_ms, .monotonic, .monotonic) != null) return;
+
+        log.warn("drops: queue_full={d} too_large={d} ring_recycled={d}", .{ qf, tl, rc });
     }
 
     /// Get the number of registered senders
@@ -903,6 +937,60 @@ test "SendPktFeed: broadcast skips source interface" {
 
     try std.testing.expect(r_a.channel.tryReceive() == null); // skipped
     try std.testing.expect(r_b.channel.tryReceive() != null); // received
+}
+
+test "SendPktFeed counts too-large and recycled drops" {
+    const allocator = std.testing.allocator;
+    var feed = try SendPktFeed.init(allocator);
+    defer feed.deinit();
+    _ = try feed.registerSender("a");
+    _ = try feed.registerSender("b");
+
+    // Oversized packet -> too_large drop (and not stored/sent).
+    var big: [MAX_PACKET_SIZE + 10]u8 = undefined;
+    feed.broadcast(&big, 0, .ethernet, 14, 20, 0);
+    try std.testing.expectEqual(@as(u64, 1), feed.stats_too_large.load(.monotonic));
+
+    feed.recordRecycledDrop();
+    feed.recordRecycledDrop();
+    try std.testing.expectEqual(@as(u64, 2), feed.stats_recycled.load(.monotonic));
+}
+
+test "SendPktFeed counts queue-full drops on an undrained channel" {
+    const allocator = std.testing.allocator;
+    var feed = try SendPktFeed.init(allocator);
+    defer feed.deinit();
+    const a = try feed.registerSender("a");
+    _ = try feed.registerSender("b");
+
+    // b's queue is never drained: the first QUEUE_SIZE sends succeed, the rest
+    // overflow and are counted as queue-full drops.
+    const overflow = 5;
+    for (0..MpscRefQueue.QUEUE_SIZE + overflow) |_| {
+        feed.broadcast("x", a.idx, .ethernet, 14, 20, 0);
+    }
+    try std.testing.expectEqual(@as(u64, overflow), feed.stats_queue_full.load(.monotonic));
+}
+
+test "SendPktFeed.maybeLogStats rate-limits and only fires with drops" {
+    const allocator = std.testing.allocator;
+    var feed = try SendPktFeed.init(allocator);
+    defer feed.deinit();
+
+    // No drops -> never updates the log timestamp.
+    feed.maybeLogStats(1000, 100);
+    try std.testing.expectEqual(@as(i64, 0), feed.stats_last_log_ms.load(.monotonic));
+
+    // With a drop, the first call past the interval logs (updates timestamp).
+    feed.recordRecycledDrop();
+    feed.maybeLogStats(1000, 100);
+    try std.testing.expectEqual(@as(i64, 1000), feed.stats_last_log_ms.load(.monotonic));
+
+    // A call within the interval does not update; past it, it updates again.
+    feed.maybeLogStats(1050, 100);
+    try std.testing.expectEqual(@as(i64, 1000), feed.stats_last_log_ms.load(.monotonic));
+    feed.maybeLogStats(1200, 100);
+    try std.testing.expectEqual(@as(i64, 1200), feed.stats_last_log_ms.load(.monotonic));
 }
 
 test "fastPatchEthernetPacket matches buildOutgoingPacketInto" {
