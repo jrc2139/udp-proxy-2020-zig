@@ -120,6 +120,9 @@ pub const Listener = struct {
         for (config.fixed_ips) |ip| {
             try self.client_cache.addFixed(ip);
         }
+        // The fixed IPs are now owned by the cache; drop the borrowed slice so
+        // the stored config never retains a pointer the caller may free.
+        self.config.fixed_ips = &[_][4]u8{};
 
         try init_tw.check(.after_fixed_ips);
 

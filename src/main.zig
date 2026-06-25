@@ -369,7 +369,9 @@ fn runWithThreads(
             .ports = args.ports.items,
             .timeout_ms = args.timeout_ms,
             .cache_ttl_minutes = args.cache_ttl,
-            .fixed_ips = try allocator.dupe([4]u8, fixed_ips.items),
+            // Borrowed: Listener.init copies these into its cache and clears the
+            // reference, so the local ArrayList (freed below) can own them.
+            .fixed_ips = fixed_ips.items,
             .promisc = is_p2p,
             .send_only = false,
             .pcap_debug = args.pcap_debug,
@@ -385,6 +387,11 @@ fn runWithThreads(
         try listeners.append(allocator, listener);
     }
 
+    // The loopback interface name is allocated separately from the args-owned
+    // interface names, so it needs its own cleanup (run after the threads join).
+    var loopback_iface: ?[:0]u8 = null;
+    defer if (loopback_iface) |n| allocator.free(n);
+
     // Add loopback listener if deliver-local is enabled
     if (args.deliver_local) {
         if (try pcap.findLoopback(allocator)) |loopback_name| {
@@ -392,6 +399,7 @@ fn runWithThreads(
 
             const lb_name = try allocator.allocSentinel(u8, loopback_name.len, 0);
             @memcpy(lb_name, loopback_name);
+            loopback_iface = lb_name;
 
             const config = ListenerConfig{
                 .iface_name = lb_name,

@@ -490,20 +490,31 @@ pub fn findAllDevices(allocator: std.mem.Allocator) ![]Interface {
     }
 
     var interfaces = try allocator.alloc(Interface, count);
-    errdefer allocator.free(interfaces);
-
     var idx: usize = 0;
+    // On a mid-enumeration allocation failure, free the per-element allocations
+    // already stored plus the array itself (the old errdefer freed only the array).
+    errdefer {
+        for (interfaces[0..idx]) |iface| {
+            allocator.free(iface.name);
+            if (iface.description) |d| allocator.free(d);
+            allocator.free(iface.addresses);
+        }
+        allocator.free(interfaces);
+    }
+
     dev = alldevs;
     while (dev) |d| : (dev = d.next) {
         // Copy name
         const name = std.mem.span(d.name);
         const name_copy = try allocator.dupe(u8, name);
+        errdefer allocator.free(name_copy);
 
         // Copy description if present
         var desc_copy: ?[]const u8 = null;
         if (d.description) |desc| {
             desc_copy = try allocator.dupe(u8, std.mem.span(desc));
         }
+        errdefer if (desc_copy) |dc| allocator.free(dc);
 
         // Count and copy addresses
         var addr_count: usize = 0;
@@ -690,4 +701,16 @@ test "parseIpv4 invalid" {
 
 test "getInterfaceMac returns null for a nonexistent interface" {
     try std.testing.expect(getInterfaceMac("nonexistent-iface-zzz999") == null);
+}
+
+test "findAllDevices cleans up on allocation failure" {
+    const Helper = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const ifs = try findAllDevices(allocator);
+            freeDevices(allocator, ifs);
+        }
+    };
+    // Runs findAllDevices with an injected failure at each allocation point and
+    // asserts no leak at any of them (and the success run frees its result).
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Helper.run, .{});
 }
