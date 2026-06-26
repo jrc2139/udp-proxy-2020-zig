@@ -30,6 +30,11 @@ fn milliTimestamp() i64 {
     return @as(i64, ts.sec) * 1000 + @divTrunc(ts.nsec, std.time.ns_per_ms);
 }
 
+/// Stop a listener after this many consecutive pcap capture errors (~5s at the
+/// 1ms idle poll). A persistent error (e.g. the interface went down) is fatal
+/// for that handle, so escalate to a visible err log + stop rather than spin.
+const MAX_CONSECUTIVE_CAPTURE_ERRORS = 5000;
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -83,8 +88,9 @@ pub const Listener = struct {
     in_dumper: ?pcap.Dumper,
     /// Pcap dumper for outgoing packets
     out_dumper: ?pcap.Dumper,
-    /// Running flag
-    running: bool,
+    /// Running flag (atomic: set false by stop()/deinit from another thread,
+    /// read by the listener thread's run loop).
+    running: std.atomic.Value(bool),
 
     /// Initialize a new listener
     pub fn init(allocator: std.mem.Allocator, config: ListenerConfig) !Listener {
@@ -102,7 +108,7 @@ pub const Listener = struct {
             .outgoing_pool = sender.OutgoingPool.init(),
             .in_dumper = null,
             .out_dumper = null,
-            .running = false,
+            .running = std.atomic.Value(bool).init(false),
         };
         // If any fallible step below fails, the HashMap backing storage
         // allocated by addFixed must be released, else we leak it.
@@ -114,6 +120,9 @@ pub const Listener = struct {
         for (config.fixed_ips) |ip| {
             try self.client_cache.addFixed(ip);
         }
+        // The fixed IPs are now owned by the cache; drop the borrowed slice so
+        // the stored config never retains a pointer the caller may free.
+        self.config.fixed_ips = &[_][4]u8{};
 
         try init_tw.check(.after_fixed_ips);
 
@@ -122,7 +131,7 @@ pub const Listener = struct {
 
     /// Deinitialize the listener
     pub fn deinit(self: *Listener) void {
-        self.running = false;
+        self.running.store(false, .release);
 
         if (self.in_dumper) |*d| {
             d.close();
@@ -185,6 +194,17 @@ pub const Listener = struct {
         if (!self.link_type.isSupported()) {
             log.err("{s}: unsupported link type: {s}", .{ self.config.iface_name, self.link_type.name() });
             return error.UnsupportedLinkType;
+        }
+
+        // Resolve the interface MAC to use as the source MAC of forwarded
+        // Ethernet frames; an all-zero source MAC can be dropped by switches.
+        if (pcap.getInterfaceMac(self.config.iface_name)) |mac| {
+            self.hw_addr = mac;
+            log.debug("{s}: source MAC {x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
+                self.config.iface_name, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+            });
+        } else if (self.link_type == .ethernet) {
+            log.warn("{s}: could not resolve interface MAC; forwarded frames will use a zero source MAC", .{self.config.iface_name});
         }
 
         // Set BPF filter -- use port-only filter for interfaces without addresses (e.g., enc0)
@@ -255,7 +275,7 @@ pub const Listener = struct {
 
     /// Main packet handling loop (zero-copy version, thread mode)
     pub fn run(self: *Listener, feed: *sender.SendPktFeed) void {
-        self.running = true;
+        self.running.store(true, .release);
 
         // Set non-blocking mode for normal (non-send-only) listeners
         // so we can interleave pcap capture with ref channel draining
@@ -276,7 +296,10 @@ pub const Listener = struct {
 
         log.debug("{s}: starting packet handler (send_only={})", .{ self.config.iface_name, self.config.send_only });
 
-        while (self.running) {
+        // Consecutive pcap capture errors; reset on any healthy read.
+        var capture_errors: u32 = 0;
+
+        while (self.running.load(.acquire)) {
             if (self.config.send_only) {
                 // Send-only mode: block on channel, no pcap capture
                 if (self.ref_channel) |channel| {
@@ -312,13 +335,21 @@ pub const Listener = struct {
                 if (self.handle) |*handle| {
                     while (true) {
                         if (handle.nextPacket()) |result| {
+                            capture_errors = 0; // healthy read (a packet, or empty)
                             if (result) |pkt_data| {
                                 self.handleIncomingPacket(pkt_data.data, pkt_data.info, feed);
                                 did_work = true;
                             } else break; // no more packets available
                         } else |err| {
-                            if (err != pcap.Error.NoMorePackets) {
-                                log.warn("{s}: capture error: {}", .{ self.config.iface_name, err });
+                            if (err == pcap.Error.NoMorePackets) break;
+                            capture_errors += 1;
+                            // Log sparsely to avoid flooding on a broken interface.
+                            if (capture_errors == 1 or capture_errors % 1000 == 0) {
+                                log.warn("{s}: capture error ({d} in a row): {}", .{ self.config.iface_name, capture_errors, err });
+                            }
+                            if (capture_errors >= MAX_CONSECUTIVE_CAPTURE_ERRORS) {
+                                log.err("{s}: capture failing persistently after {d} consecutive errors; stopping this interface's listener", .{ self.config.iface_name, capture_errors });
+                                self.running.store(false, .release);
                             }
                             break;
                         }
@@ -343,6 +374,7 @@ pub const Listener = struct {
             const now = milliTimestamp();
             if (now - last_cleanup > cleanup_interval) {
                 self.client_cache.cleanup();
+                feed.maybeLogStats(now, cleanup_interval);
                 last_cleanup = now;
             }
         }
@@ -394,9 +426,18 @@ pub const Listener = struct {
     /// Send packets from a packet reference (zero-copy version).
     /// Uses pre-computed header offsets from PacketRef to skip re-parsing.
     fn sendPacketsFromRef(self: *Listener, ref: sender.PacketRef) !void {
-        // Get packet data from the shared ring buffer
+        // Copy the packet out of the shared ring ONCE into a private buffer,
+        // validating the slot was not recycled by a faster producer. After this
+        // point all work is on the private copy, so the ring is never re-read.
+        // align(4): the header pointer casts below require >=2-byte alignment;
+        // a stack [N]u8 would otherwise default to align 1.
+        var scratch: [sender.MAX_PACKET_SIZE]u8 align(4) = undefined;
         const pkt_data = if (self.feed) |feed|
-            feed.getPacketData(ref.ring_idx)
+            (feed.copyPacket(ref.seq, &scratch) orelse {
+                feed.recordRecycledDrop();
+                log.debug("{s}: dropped packet: ring slot recycled before forward (seq={d})", .{ self.config.iface_name, ref.seq });
+                return;
+            })
         else
             return error.NoFeed;
 
@@ -412,7 +453,11 @@ pub const Listener = struct {
         const ipv4: *const packet.IPv4Header = @ptrCast(@alignCast(pkt_data.ptr + ref.l2_size));
         const udp: *const packet.UdpHeader = @ptrCast(@alignCast(pkt_data.ptr + ref.l2_size + ref.ip_header_len));
         const payload_start = @as(usize, ref.l2_size) + ref.ip_header_len + packet.UDP_HEADER_SIZE;
-        const payload = if (payload_start < pkt_data.len) pkt_data[payload_start..] else &[_]u8{};
+        // Trim to the UDP length field so Ethernet padding is not forwarded as
+        // payload (the rebuild path recomputes lengths from this slice). The
+        // min_len check above guarantees payload_start <= pkt_data.len.
+        const payload_len = packet.udpPayloadLen(udp.getLength(), pkt_data.len - payload_start);
+        const payload = pkt_data[payload_start .. payload_start + payload_len];
 
         const parsed = packet.ParsedPacket{
             .link_type = sender.idxToLinkType(ref.link_type_idx),
@@ -475,7 +520,7 @@ pub const Listener = struct {
             ref.ip_header_len == packet.IPV4_MIN_HEADER_SIZE) // standard IPv4, no options
             try sender.fastPatchEthernetPacket(
                 buffer,
-                self.feed.?.getPacketData(ref.ring_idx),
+                parsed.raw_data,
                 dst_ip,
                 self.hw_addr,
             )
@@ -517,7 +562,7 @@ pub const Listener = struct {
 
     /// Stop the listener
     pub fn stop(self: *Listener) void {
-        self.running = false;
+        self.running.store(false, .release);
         if (self.ref_channel) |channel| {
             channel.close();
         }
@@ -630,4 +675,41 @@ test "Listener.init tripwires clean up on failure at every point" {
         );
     }
     init_tw.reset();
+}
+
+test "Listener.run exits promptly when stopped" {
+    const allocator = std.testing.allocator;
+    var feed = try sender.SendPktFeed.init(allocator);
+    defer feed.deinit();
+
+    const config = ListenerConfig{
+        .iface_name = "lo",
+        .ports = &[_]u16{9003},
+        .timeout_ms = 100,
+        .cache_ttl_minutes = 5,
+        .fixed_ips = &[_][4]u8{},
+        .promisc = false,
+        .send_only = false,
+        .pcap_debug = false,
+        .pcap_path = "",
+    };
+    var listener = try Listener.init(allocator, config);
+    defer listener.deinit();
+    // No open() -> the pcap handle stays null, so run() just idles checking the
+    // `running` flag each iteration.
+
+    const Runner = struct {
+        fn go(l: *Listener, f: *sender.SendPktFeed) void {
+            l.run(f);
+        }
+    };
+    var thread = try std.Thread.spawn(.{}, Runner.go, .{ &listener, &feed });
+
+    // Let the loop start, then request shutdown. join() returns only if run()
+    // observed the stop and exited -- otherwise this test hangs, which is the
+    // failure signal.
+    const ns = std.c.timespec{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
+    _ = std.c.nanosleep(&ns, null);
+    listener.stop();
+    thread.join();
 }

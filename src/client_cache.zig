@@ -5,8 +5,11 @@
 //! interfaces like VPN tunnels.
 //!
 //! Design: Uses [4]u8 as direct keys (no string conversion overhead).
-//! Iterator is lock-free for the hot path, with epoch-based cleanup
-//! that never invalidates in-flight iterations.
+//!
+//! Ownership: each cache is owned by exactly one listener thread -- learn(),
+//! iterator(), cleanup() and friends are all called from that thread's run
+//! loop -- so it is intentionally not synchronized. Do not share a cache across
+//! threads without adding synchronization.
 
 const std = @import("std");
 
@@ -31,8 +34,8 @@ pub const ClientEntry = struct {
     is_fixed: bool,
 };
 
-/// Thread-safe client cache with TTL support
-/// Uses [4]u8 directly as keys - no string allocation or parsing overhead
+/// Per-listener client cache with TTL support (single-thread-owned; see the
+/// module doc). Uses [4]u8 directly as keys -- no string allocation or parsing.
 pub const ClientCache = struct {
     /// Map of IP addresses to client entries
     /// Using [4]u8 directly: hash is fast (4 bytes), no allocation needed
@@ -41,12 +44,6 @@ pub const ClientCache = struct {
     allocator: std.mem.Allocator,
     /// TTL in milliseconds
     ttl_ms: i64,
-    /// Mutex for thread safety
-    mutex: std.Io.Mutex,
-    /// Cleanup epoch - incremented on each cleanup to signal iterators.
-    /// u32 so fetchAdd lowers on 32-bit targets (armv7) where Zig's stdlib
-    /// rejects 64-bit @atomicRmw; ~4B cycles at ~30s per cleanup is plenty.
-    cleanup_epoch: std.atomic.Value(u32),
 
     /// Initialize a new client cache
     pub fn init(allocator: std.mem.Allocator, ttl_minutes: u32) ClientCache {
@@ -56,23 +53,16 @@ pub const ClientCache = struct {
             .clients = std.AutoHashMap([4]u8, ClientEntry).init(allocator),
             .allocator = allocator,
             .ttl_ms = ttl_ms,
-            .mutex = std.Io.Mutex.init,
-            .cleanup_epoch = std.atomic.Value(u32).init(0),
         };
     }
 
     /// Deinitialize the cache
     pub fn deinit(self: *ClientCache) void {
-        self.mutex.lockUncancelable(undefined);
-        defer self.mutex.unlock(undefined);
         self.clients.deinit();
     }
 
     /// Add a fixed IP that never expires
     pub fn addFixed(self: *ClientCache, ip: [4]u8) !void {
-        self.mutex.lockUncancelable(undefined);
-        defer self.mutex.unlock(undefined);
-
         // Check if already exists as fixed
         if (self.clients.get(ip)) |existing| {
             if (existing.is_fixed) {
@@ -90,9 +80,6 @@ pub const ClientCache = struct {
 
     /// Learn a client IP (update TTL if exists)
     pub fn learn(self: *ClientCache, ip: [4]u8) !void {
-        self.mutex.lockUncancelable(undefined);
-        defer self.mutex.unlock(undefined);
-
         const now = milliTimestamp();
         const expires_at: i64 = now + self.ttl_ms;
 
@@ -114,9 +101,8 @@ pub const ClientCache = struct {
         log.debug("Learned client IP: {d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] });
     }
 
-    /// Zero-allocation iterator for valid (non-expired) clients.
-    /// Safe to use without holding mutex - cleanup uses epoch to avoid
-    /// invalidating in-flight iterators.
+    /// Zero-allocation iterator over valid (non-expired) clients. Must be used
+    /// only by the owning thread (it walks the live HashMap directly).
     pub const ClientIterator = struct {
         inner: std.AutoHashMap([4]u8, ClientEntry).Iterator,
         now: i64,
@@ -131,8 +117,7 @@ pub const ClientCache = struct {
         }
     };
 
-    /// Get an iterator over valid clients (zero allocation).
-    /// Thread-safe: uses snapshot semantics with lazy expiration check.
+    /// Get an iterator over valid clients (zero allocation, lazy expiration).
     pub fn iterator(self: *ClientCache) ClientIterator {
         return ClientIterator{
             .inner = self.clients.iterator(),
@@ -142,21 +127,21 @@ pub const ClientCache = struct {
 
     /// Remove expired entries using stack-allocated collection (no heap allocation).
     pub fn cleanup(self: *ClientCache) void {
-        self.mutex.lockUncancelable(undefined);
-        defer self.mutex.unlock(undefined);
-
         const now = milliTimestamp();
 
         // Stack-allocated buffer for expired keys (64 clients is plenty for VPN peers)
         var to_remove: [64][4]u8 = undefined;
         var remove_count: usize = 0;
 
+        var capped = false;
         var iter = self.clients.iterator();
         while (iter.next()) |entry| {
             if (!entry.value_ptr.is_fixed and entry.value_ptr.expires_at <= now) {
                 if (remove_count < to_remove.len) {
                     to_remove[remove_count] = entry.key_ptr.*;
                     remove_count += 1;
+                } else {
+                    capped = true;
                 }
             }
         }
@@ -166,21 +151,18 @@ pub const ClientCache = struct {
             _ = self.clients.remove(ip);
         }
 
-        _ = self.cleanup_epoch.fetchAdd(1, .release);
+        if (capped) {
+            log.warn("client cache cleanup hit the {d}-entry cap; remaining expired clients will be removed next cycle", .{to_remove.len});
+        }
     }
 
     /// Get the number of clients (including expired)
     pub fn count(self: *ClientCache) usize {
-        self.mutex.lockUncancelable(undefined);
-        defer self.mutex.unlock(undefined);
         return self.clients.count();
     }
 
     /// Check if a client exists
     pub fn contains(self: *ClientCache, ip: [4]u8) bool {
-        self.mutex.lockUncancelable(undefined);
-        defer self.mutex.unlock(undefined);
-
         if (self.clients.get(ip)) |entry| {
             if (entry.is_fixed) return true;
 

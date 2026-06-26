@@ -21,6 +21,13 @@ const tripwire = @import("tripwire");
 
 const log = std.log.scoped(.sender);
 
+/// Valid `Io` backing the contended (futex) path of `reg_mutex`. The Threaded
+/// futex ops ignore userdata, so the process-wide instance is a correct
+/// source; passing `undefined` would crash on lock contention.
+inline fn syncIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
 /// Tripwire points for SendPktFeed.init. Test-only; inlined to no-ops in
 /// release builds via tripwire.enabled = builtin.is_test.
 pub const feed_init_tw = tripwire.module(enum {
@@ -43,42 +50,77 @@ pub const RING_SIZE = 256;
 
 /// Pre-allocated ring buffer for packet data.
 /// Stores packets in fixed slots, eliminating per-packet allocation.
+///
+/// Slot lifetime safety: the ring is shared by all producers, and a captured
+/// packet's slot can be recycled (overwritten) while a lagging consumer still
+/// holds a reference to it. Each slot therefore carries a generation stamp
+/// (`seqs`). A consumer copies the bytes out and verifies (seqlock) that the
+/// slot still held its packet before and after the copy; a mismatch means the
+/// slot was recycled, so the consumer drops the packet instead of forwarding
+/// corrupt data.
 pub const PacketRing = struct {
+    /// Top bit of a stamp marks "write in progress"; the low 31 bits are the
+    /// store sequence number. A consumer's seq never has the top bit set, so a
+    /// slot that is mid-write never compares equal to a held seq.
+    const WRITING_BIT: u32 = 0x8000_0000;
+    const SEQ_MASK: u32 = 0x7FFF_FFFF;
+
     buffers: [RING_SIZE][MAX_PACKET_SIZE]u8,
     lengths: [RING_SIZE]u16,
+    /// Per-slot generation stamp (see WRITING_BIT / SEQ_MASK).
+    seqs: [RING_SIZE]std.atomic.Value(u32),
     write_idx: std.atomic.Value(u32),
 
     pub fn init() PacketRing {
-        return PacketRing{
+        var self = PacketRing{
             .buffers = undefined,
             .lengths = [_]u16{0} ** RING_SIZE,
+            .seqs = undefined,
             .write_idx = std.atomic.Value(u32).init(0),
         };
+        for (0..RING_SIZE) |i| self.seqs[i] = std.atomic.Value(u32).init(0);
+        return self;
     }
 
-    /// Store packet data and return the slot index.
-    /// Thread-safe via atomic increment. The non-atomic memcpy/length writes
-    /// are ordered by the sequence store (release) in MpscRefQueue.push(),
-    /// which the consumer observes via sequence load (acquire) in pop().
-    pub fn store(self: *PacketRing, data: []const u8) u8 {
-        const idx = self.write_idx.fetchAdd(1, .monotonic) % RING_SIZE;
+    /// Store packet data and return its unique sequence number, which also
+    /// encodes the slot (`seq % RING_SIZE`). The slot's stamp is set to WRITING
+    /// before the copy and to `seq` after, so a consumer holding a previous seq
+    /// for the same slot detects the overwrite in `copyOut`.
+    pub fn store(self: *PacketRing, data: []const u8) u32 {
+        const raw = self.write_idx.fetchAdd(1, .monotonic);
+        const seq = raw & SEQ_MASK;
+        const idx = raw % RING_SIZE;
         const len: u16 = @intCast(@min(data.len, MAX_PACKET_SIZE));
+        self.seqs[idx].store(seq | WRITING_BIT, .release);
         @memcpy(self.buffers[idx][0..len], data[0..len]);
         self.lengths[idx] = len;
-        return @intCast(idx);
+        self.seqs[idx].store(seq, .release);
+        return seq;
     }
 
-    /// Get packet data from a slot.
-    pub fn get(self: *const PacketRing, idx: u8) []const u8 {
-        return self.buffers[idx][0..self.lengths[idx]];
+    /// Copy the packet identified by `seq` into `dst`, validating (seqlock)
+    /// that the slot still holds that store before and after the copy. Returns
+    /// the copied slice, or null if the slot was recycled/overwritten -- the
+    /// caller must then drop the packet. `dst` should be at least
+    /// MAX_PACKET_SIZE; the copy is clamped to `dst.len` regardless.
+    pub fn copyOut(self: *const PacketRing, seq: u32, dst: []u8) ?[]const u8 {
+        const idx = seq % RING_SIZE;
+        if (self.seqs[idx].load(.acquire) != seq) return null;
+        const len = @min(@as(usize, self.lengths[idx]), @min(dst.len, MAX_PACKET_SIZE));
+        @memcpy(dst[0..len], self.buffers[idx][0..len]);
+        // Re-validate: an overwrite concurrent with the copy may have torn the
+        // bytes, so discard them if the slot no longer holds our seq.
+        if (self.seqs[idx].load(.acquire) != seq) return null;
+        return dst[0..len];
     }
 };
 
 /// Lightweight packet reference - passed through channels instead of full packet data.
 /// 16 bytes: fits in half a cache line. MpscRefQueue items fit in L1 cache (4KB).
 pub const PacketRef = struct {
-    /// Index into the shared ring buffer
-    ring_idx: u8,
+    /// Ring store sequence number; also encodes the slot (`seq % RING_SIZE`).
+    /// The consumer validates the slot still holds this seq before forwarding.
+    seq: u32,
     /// Compact link type index (0=ethernet, 1=null, 2=loop, 3=enc, 4=raw)
     link_type_idx: u8,
     /// Source interface index (into SendPktFeed.iface_channels)
@@ -87,7 +129,6 @@ pub const PacketRef = struct {
     l2_size: u8,
     /// IPv4 header length in bytes (usually 20)
     ip_header_len: u8,
-    _pad: [3]u8 = .{ 0, 0, 0 },
     /// Capture timestamp in microseconds since epoch
     timestamp_us: i64,
 };
@@ -137,11 +178,12 @@ pub const MpscRefQueue = struct {
 
     items: [QUEUE_SIZE]PacketRef,
     sequence: [QUEUE_SIZE]std.atomic.Value(u32),
-    write_pos: std.atomic.Value(u32),
-    // Cache-line padding: prevent false sharing between producer (write_pos)
-    // and consumer (read_pos) which would cause cache-line bouncing.
-    _cache_pad: [60]u8 = undefined,
-    read_pos: u32, // only consumer touches this
+    // Align the producer (write_pos) and consumer (read_pos) cursors to separate
+    // cache lines to avoid false sharing. The previous fixed 60-byte pad only
+    // isolated them if the whole queue happened to be cache-line aligned, which
+    // the struct's u32 alignment did not guarantee.
+    write_pos: std.atomic.Value(u32) align(std.atomic.cache_line),
+    read_pos: u32 align(std.atomic.cache_line), // only consumer touches this
 
     pub fn init() MpscRefQueue {
         var self: MpscRefQueue = undefined;
@@ -270,6 +312,12 @@ pub const SendPktFeed = struct {
     allocator: std.mem.Allocator,
     /// Mutex for registration (not used in hot path)
     reg_mutex: std.Io.Mutex,
+    /// Drop counters (atomic; incremented from any producer thread).
+    stats_queue_full: std.atomic.Value(u64),
+    stats_too_large: std.atomic.Value(u64),
+    stats_recycled: std.atomic.Value(u64),
+    /// Last drop-summary log time (ms since epoch) for rate-limiting.
+    stats_last_log_ms: std.atomic.Value(i64),
 
     pub fn init(allocator: std.mem.Allocator) !SendPktFeed {
         const ring = try allocator.create(PacketRing);
@@ -283,6 +331,10 @@ pub const SendPktFeed = struct {
             .ring = ring,
             .allocator = allocator,
             .reg_mutex = std.Io.Mutex.init,
+            .stats_queue_full = std.atomic.Value(u64).init(0),
+            .stats_too_large = std.atomic.Value(u64).init(0),
+            .stats_recycled = std.atomic.Value(u64).init(0),
+            .stats_last_log_ms = std.atomic.Value(i64).init(0),
         };
     }
 
@@ -303,8 +355,8 @@ pub const SendPktFeed = struct {
 
     /// Register a ref channel for an interface. Returns the interface index.
     pub fn registerSender(self: *SendPktFeed, iface_name: []const u8) !struct { channel: *RefChannel, idx: u8 } {
-        self.reg_mutex.lockUncancelable(undefined);
-        defer self.reg_mutex.unlock(undefined);
+        self.reg_mutex.lockUncancelable(syncIo());
+        defer self.reg_mutex.unlock(syncIo());
 
         if (self.iface_count >= MAX_IFACES) {
             log.err("Too many interfaces (max {d})", .{MAX_IFACES});
@@ -329,9 +381,10 @@ pub const SendPktFeed = struct {
         return .{ .channel = channel, .idx = idx };
     }
 
-    /// Get packet data from the shared ring buffer
-    pub fn getPacketData(self: *const SendPktFeed, ring_idx: u8) []const u8 {
-        return self.ring.get(ring_idx);
+    /// Copy the packet for `seq` out of the shared ring into `dst`, validating
+    /// the slot was not recycled. Returns null if the consumer must drop it.
+    pub fn copyPacket(self: *const SendPktFeed, seq: u32, dst: []u8) ?[]const u8 {
+        return self.ring.copyOut(seq, dst);
     }
 
     /// Broadcast a packet to all interfaces except the source (zero-copy).
@@ -346,16 +399,16 @@ pub const SendPktFeed = struct {
         timestamp_us: i64,
     ) void {
         if (data.len > MAX_PACKET_SIZE) {
-            log.warn("Packet too large to broadcast: {d} bytes", .{data.len});
+            _ = self.stats_too_large.fetchAdd(1, .monotonic);
             return;
         }
 
         // Store packet data in ring buffer (one copy)
-        const ring_idx = self.ring.store(data);
+        const seq = self.ring.store(data);
 
         // Create compact ref (16 bytes)
         const ref = PacketRef{
-            .ring_idx = ring_idx,
+            .seq = seq,
             .link_type_idx = linkTypeToIdx(link_type),
             .src_iface_idx = src_iface_idx,
             .l2_size = l2_size,
@@ -366,10 +419,34 @@ pub const SendPktFeed = struct {
         // Iterate frozen array -- no lock needed, array is immutable after startup
         for (0..self.iface_count) |i| {
             if (i == src_iface_idx) continue;
-            self.iface_channels[i].send(ref) catch |err| {
-                log.warn("Failed to send ref to iface {d}: {}", .{ i, err });
+            self.iface_channels[i].send(ref) catch {
+                // Destination queue full (consumer overloaded). Count rather than
+                // log per-event; broadcast is the hot path and would flood.
+                _ = self.stats_queue_full.fetchAdd(1, .monotonic);
             };
         }
+    }
+
+    /// Record a packet dropped because its ring slot was recycled before the
+    /// consumer could read it (an overload indicator).
+    pub fn recordRecycledDrop(self: *SendPktFeed) void {
+        _ = self.stats_recycled.fetchAdd(1, .monotonic);
+    }
+
+    /// Log a one-line drop summary at most once per `interval_ms`, and only when
+    /// there is something to report. Safe to call from every listener thread;
+    /// the CAS ensures a single emitter per interval.
+    pub fn maybeLogStats(self: *SendPktFeed, now_ms: i64, interval_ms: i64) void {
+        const qf = self.stats_queue_full.load(.monotonic);
+        const tl = self.stats_too_large.load(.monotonic);
+        const rc = self.stats_recycled.load(.monotonic);
+        if (qf == 0 and tl == 0 and rc == 0) return;
+
+        const last = self.stats_last_log_ms.load(.monotonic);
+        if (now_ms - last < interval_ms) return;
+        if (self.stats_last_log_ms.cmpxchgStrong(last, now_ms, .monotonic, .monotonic) != null) return;
+
+        log.warn("drops: queue_full={d} too_large={d} ring_recycled={d}", .{ qf, tl, rc });
     }
 
     /// Get the number of registered senders
@@ -429,7 +506,11 @@ pub fn buildOutgoingPacketInto(
         .raw => 0,
         else => return error.UnsupportedLinkType,
     };
-    const ip_header_size = original_ipv4.getHeaderLength();
+    // PacketBuilder.addIPv4 always writes a 20-byte header (IHL=5) and any
+    // source IP options are dropped, so size everything from the 20-byte header.
+    // Using the original (possibly larger) IHL here would make total_length
+    // overstate the bytes actually written.
+    const ip_header_size = packet.IPV4_MIN_HEADER_SIZE;
     const udp_size = packet.UDP_HEADER_SIZE;
     const payload_size = parsed.payload.len;
     const total_size = l2_size + ip_header_size + udp_size + payload_size;
@@ -525,6 +606,17 @@ pub fn fastPatchEthernetPacket(
     const ipv4: *packet.IPv4Header = @ptrCast(@alignCast(buffer.ptr + packet.ETHERNET_HEADER_SIZE));
     packet.calculateIpChecksum(ipv4);
 
+    // The destination IP changed, and it is covered by the UDP pseudo-header, so
+    // the original UDP checksum is now invalid -- a receiver that validates it
+    // would drop the packet. Zero it (0 disables the optional IPv4 UDP checksum),
+    // matching buildOutgoingPacketInto. Guarded by length since this helper does
+    // not otherwise require a UDP header to be present.
+    const udp_csum_off = packet.ETHERNET_HEADER_SIZE + packet.IPV4_MIN_HEADER_SIZE + 6;
+    if (original.len >= udp_csum_off + 2) {
+        buffer[udp_csum_off] = 0;
+        buffer[udp_csum_off + 1] = 0;
+    }
+
     return buffer[0..original.len];
 }
 
@@ -550,10 +642,28 @@ test "PacketRing store and retrieve" {
     var ring = PacketRing.init();
     const data = "Hello, World!";
 
-    const idx = ring.store(data);
-    const retrieved = ring.get(idx);
+    const seq = ring.store(data);
+    var buf: [MAX_PACKET_SIZE]u8 = undefined;
+    const retrieved = ring.copyOut(seq, &buf).?;
 
     try std.testing.expectEqualStrings(data, retrieved);
+}
+
+test "PacketRing.copyOut detects slot recycling" {
+    var ring = PacketRing.init();
+    var buf: [MAX_PACKET_SIZE]u8 = undefined;
+
+    const seq_a = ring.store("packet A");
+    // Valid immediately after store.
+    try std.testing.expectEqualStrings("packet A", ring.copyOut(seq_a, &buf).?);
+
+    // Overwrite the same slot RING_SIZE times so seq_a's slot is recycled.
+    for (0..RING_SIZE) |_| {
+        _ = ring.store("newer packet");
+    }
+
+    // seq_a's slot now holds a newer store -> copyOut must drop (null).
+    try std.testing.expect(ring.copyOut(seq_a, &buf) == null);
 }
 
 test "OutgoingPool round-robin" {
@@ -572,7 +682,7 @@ test "OutgoingPool round-robin" {
 
 fn makeRef(idx: u8) PacketRef {
     return PacketRef{
-        .ring_idx = idx,
+        .seq = idx,
         .link_type_idx = 0, // ethernet
         .src_iface_idx = 0,
         .l2_size = 14,
@@ -590,9 +700,9 @@ test "MpscRefQueue: single-threaded push and pop" {
     try std.testing.expect(q.push(makeRef(2)));
     try std.testing.expect(q.push(makeRef(3)));
 
-    try std.testing.expectEqual(@as(u8, 1), q.pop().?.ring_idx);
-    try std.testing.expectEqual(@as(u8, 2), q.pop().?.ring_idx);
-    try std.testing.expectEqual(@as(u8, 3), q.pop().?.ring_idx);
+    try std.testing.expectEqual(@as(u32, 1), q.pop().?.seq);
+    try std.testing.expectEqual(@as(u32, 2), q.pop().?.seq);
+    try std.testing.expectEqual(@as(u32, 3), q.pop().?.seq);
     try std.testing.expect(q.pop() == null); // drained
 }
 
@@ -619,7 +729,7 @@ test "MpscRefQueue: wrap-around correctness" {
     for (0..MpscRefQueue.QUEUE_SIZE * 3) |i| {
         try std.testing.expect(q.push(makeRef(@intCast(i & 0xFF))));
         const ref = q.pop().?;
-        try std.testing.expectEqual(@as(u8, @intCast(i & 0xFF)), ref.ring_idx);
+        try std.testing.expectEqual(@as(u32, @intCast(i & 0xFF)), ref.seq);
     }
 
     try std.testing.expect(q.isEmpty());
@@ -680,7 +790,7 @@ test "MpscRefQueue: MPSC stress test" {
 
     while (total < expected_total) {
         if (q.pop()) |ref| {
-            counts[ref.ring_idx] += 1;
+            counts[ref.seq] += 1;
             total += 1;
         } else {
             std.atomic.spinLoopHint();
@@ -708,8 +818,8 @@ test "RefChannel: send and tryReceive" {
     try ch.send(makeRef(10));
     try ch.send(makeRef(20));
 
-    try std.testing.expectEqual(@as(u8, 10), ch.tryReceive().?.ring_idx);
-    try std.testing.expectEqual(@as(u8, 20), ch.tryReceive().?.ring_idx);
+    try std.testing.expectEqual(@as(u32, 10), ch.tryReceive().?.seq);
+    try std.testing.expectEqual(@as(u32, 20), ch.tryReceive().?.seq);
     try std.testing.expect(ch.tryReceive() == null);
 }
 
@@ -731,7 +841,7 @@ test "RefChannel: receive drains on close" {
     // Should still get the queued item
     const ref = ch.receive();
     try std.testing.expect(ref != null);
-    try std.testing.expectEqual(@as(u8, 42), ref.?.ring_idx);
+    try std.testing.expectEqual(@as(u32, 42), ref.?.seq);
 
     // Now should get null (closed + empty)
     try std.testing.expect(ch.receive() == null);
@@ -774,7 +884,7 @@ test "RefChannel: MPSC concurrent send + tryReceive" {
 
     while (total < expected) {
         if (ch.tryReceive()) |ref| {
-            counts[ref.ring_idx] += 1;
+            counts[ref.seq] += 1;
             total += 1;
         } else {
             std.atomic.spinLoopHint();
@@ -830,6 +940,60 @@ test "SendPktFeed: broadcast skips source interface" {
     try std.testing.expect(r_b.channel.tryReceive() != null); // received
 }
 
+test "SendPktFeed counts too-large and recycled drops" {
+    const allocator = std.testing.allocator;
+    var feed = try SendPktFeed.init(allocator);
+    defer feed.deinit();
+    _ = try feed.registerSender("a");
+    _ = try feed.registerSender("b");
+
+    // Oversized packet -> too_large drop (and not stored/sent).
+    var big: [MAX_PACKET_SIZE + 10]u8 = undefined;
+    feed.broadcast(&big, 0, .ethernet, 14, 20, 0);
+    try std.testing.expectEqual(@as(u64, 1), feed.stats_too_large.load(.monotonic));
+
+    feed.recordRecycledDrop();
+    feed.recordRecycledDrop();
+    try std.testing.expectEqual(@as(u64, 2), feed.stats_recycled.load(.monotonic));
+}
+
+test "SendPktFeed counts queue-full drops on an undrained channel" {
+    const allocator = std.testing.allocator;
+    var feed = try SendPktFeed.init(allocator);
+    defer feed.deinit();
+    const a = try feed.registerSender("a");
+    _ = try feed.registerSender("b");
+
+    // b's queue is never drained: the first QUEUE_SIZE sends succeed, the rest
+    // overflow and are counted as queue-full drops.
+    const overflow = 5;
+    for (0..MpscRefQueue.QUEUE_SIZE + overflow) |_| {
+        feed.broadcast("x", a.idx, .ethernet, 14, 20, 0);
+    }
+    try std.testing.expectEqual(@as(u64, overflow), feed.stats_queue_full.load(.monotonic));
+}
+
+test "SendPktFeed.maybeLogStats rate-limits and only fires with drops" {
+    const allocator = std.testing.allocator;
+    var feed = try SendPktFeed.init(allocator);
+    defer feed.deinit();
+
+    // No drops -> never updates the log timestamp.
+    feed.maybeLogStats(1000, 100);
+    try std.testing.expectEqual(@as(i64, 0), feed.stats_last_log_ms.load(.monotonic));
+
+    // With a drop, the first call past the interval logs (updates timestamp).
+    feed.recordRecycledDrop();
+    feed.maybeLogStats(1000, 100);
+    try std.testing.expectEqual(@as(i64, 1000), feed.stats_last_log_ms.load(.monotonic));
+
+    // A call within the interval does not update; past it, it updates again.
+    feed.maybeLogStats(1050, 100);
+    try std.testing.expectEqual(@as(i64, 1000), feed.stats_last_log_ms.load(.monotonic));
+    feed.maybeLogStats(1200, 100);
+    try std.testing.expectEqual(@as(i64, 1200), feed.stats_last_log_ms.load(.monotonic));
+}
+
 test "fastPatchEthernetPacket matches buildOutgoingPacketInto" {
     // Buffers need 4-byte alignment because PacketBuilder casts the backing
     // storage to *IPv4Header (u32 fields); stack u8 arrays default to align 1.
@@ -869,6 +1033,76 @@ test "fastPatchEthernetPacket matches buildOutgoingPacketInto" {
     // Both should produce identical output
     try std.testing.expectEqual(full_result.len, fast_result.len);
     try std.testing.expectEqualSlices(u8, full_result, fast_result);
+}
+
+test "fastPatchEthernetPacket zeroes stale UDP checksum after dst-IP rewrite" {
+    // Real mDNS/SSDP/Sonos packets carry a non-zero UDP checksum. The fast path
+    // rewrites the destination IP, which is covered by the UDP pseudo-header, so
+    // the original checksum becomes invalid and receivers would drop the packet.
+    var original: [100]u8 align(4) = undefined;
+    var builder = packet.PacketBuilder.init(&original);
+
+    const src_mac = [_]u8{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55 };
+    const dst_mac = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };
+    _ = try builder.addEthernet(src_mac, dst_mac, .ipv4);
+    const ipv4 = try builder.addIPv4(.{ 192, 168, 1, 1 }, .{ 192, 168, 1, 255 }, .udp, 64);
+    const udp_hdr = try builder.addUDP(9003, 9003);
+    try builder.addPayload("hello world");
+
+    ipv4.setTotalLength(@intCast(packet.IPV4_MIN_HEADER_SIZE + packet.UDP_HEADER_SIZE + 11));
+    udp_hdr.setLength(@intCast(packet.UDP_HEADER_SIZE + 11));
+    // Stamp a non-zero UDP checksum, as a real captured packet would have.
+    udp_hdr.checksum = std.mem.nativeToBig(u16, 0xABCD);
+    packet.calculateIpChecksum(ipv4);
+
+    const pkt_data = builder.getData();
+
+    var buf_fast: [MAX_PACKET_SIZE]u8 align(4) = undefined;
+    const new_src_mac = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x00, 0x01 };
+    const fast = try fastPatchEthernetPacket(&buf_fast, pkt_data, .{ 10, 0, 0, 1 }, new_src_mac);
+
+    // The fast path must zero the now-invalid UDP checksum (0 disables it, which
+    // is valid for IPv4 UDP and matches buildOutgoingPacketInto).
+    const out_udp: *const packet.UdpHeader = @ptrCast(@alignCast(fast.ptr + packet.ETHERNET_HEADER_SIZE + packet.IPV4_MIN_HEADER_SIZE));
+    try std.testing.expectEqual(@as(u16, 0), out_udp.checksum);
+}
+
+test "buildOutgoingPacketInto writes a 20-byte IPv4 header and consistent total_length" {
+    // Hand-craft Ethernet + IPv4(IHL=6, i.e. 4 option bytes) + UDP + 2B payload.
+    // PacketBuilder always writes IHL=5, so the rebuild must drop the options and
+    // report total_length for the 20-byte header it actually emits.
+    var raw: [48]u8 = std.mem.zeroes([48]u8);
+    std.mem.writeInt(u16, raw[12..14], @intFromEnum(packet.EtherType.ipv4), .big);
+    const ip_off = packet.ETHERNET_HEADER_SIZE; // 14
+    raw[ip_off] = (4 << 4) | 6; // version 4, IHL 6 => 24-byte header
+    raw[ip_off + 9] = @intFromEnum(packet.IpProtocol.udp);
+    raw[ip_off + 12] = 192;
+    raw[ip_off + 13] = 168;
+    raw[ip_off + 14] = 1;
+    raw[ip_off + 15] = 1; // src 192.168.1.1
+    raw[ip_off + 16] = 192;
+    raw[ip_off + 17] = 168;
+    raw[ip_off + 18] = 1;
+    raw[ip_off + 19] = 255; // dst 192.168.1.255
+    const udp_off = ip_off + 24; // 38
+    std.mem.writeInt(u16, raw[udp_off..][0..2], 9003, .big);
+    std.mem.writeInt(u16, raw[udp_off + 2 ..][0..2], 9003, .big);
+    std.mem.writeInt(u16, raw[udp_off + 4 ..][0..2], packet.UDP_HEADER_SIZE + 2, .big);
+    raw[udp_off + 8] = 'h';
+    raw[udp_off + 9] = 'i';
+
+    const parsed = try packet.parsePacket(&raw, .ethernet);
+    try std.testing.expectEqual(@as(usize, 24), parsed.ipv4.?.getHeaderLength());
+
+    var out: [MAX_PACKET_SIZE]u8 align(4) = undefined;
+    const result = try buildOutgoingPacketInto(&out, parsed, .{ 10, 0, 0, 1 }, .ethernet, .{ 0, 0, 0, 0, 0, 0 });
+
+    const out_ipv4: *const packet.IPv4Header = @ptrCast(@alignCast(result.ptr + packet.ETHERNET_HEADER_SIZE));
+    try std.testing.expectEqual(@as(u4, 5), out_ipv4.getIHL());
+    try std.testing.expectEqual(
+        @as(u16, packet.IPV4_MIN_HEADER_SIZE + packet.UDP_HEADER_SIZE + 2),
+        out_ipv4.getTotalLength(),
+    );
 }
 
 test "compact PacketRef is 16 bytes" {

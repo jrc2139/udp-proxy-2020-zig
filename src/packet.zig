@@ -247,6 +247,15 @@ pub const ParseError = error{
     InvalidHeaderLength,
 };
 
+/// Number of UDP payload bytes given the UDP header's length field and the
+/// bytes actually available after the UDP header. Trims to the smaller of the
+/// two so Ethernet padding captured beyond the UDP length is not treated as
+/// payload, and a length field larger than the capture cannot over-read.
+pub fn udpPayloadLen(udp_length_field: u16, available: usize) usize {
+    const declared: usize = if (udp_length_field > UDP_HEADER_SIZE) udp_length_field - UDP_HEADER_SIZE else 0;
+    return @min(declared, available);
+}
+
 /// Parse a raw packet based on link type
 pub fn parsePacket(data: []const u8, link_type: pcap.LinkType) ParseError!ParsedPacket {
     var result = ParsedPacket{
@@ -267,7 +276,9 @@ pub fn parsePacket(data: []const u8, link_type: pcap.LinkType) ParseError!Parsed
             result.ethernet = eth;
             offset = ETHERNET_HEADER_SIZE;
 
-            // Check ether type
+            // Only IPv4 is forwarded. VLAN-tagged (0x8100) and IPv6 (0x86DD)
+            // frames are intentionally unsupported and dropped here; the caller
+            // logs the parse failure at debug level.
             if (eth.getEtherType() != .ipv4) {
                 return ParseError.UnsupportedEtherType;
             }
@@ -343,10 +354,10 @@ pub fn parsePacket(data: []const u8, link_type: pcap.LinkType) ParseError!Parsed
     result.udp = udp;
     offset += UDP_HEADER_SIZE;
 
-    // Remaining is payload
-    if (offset < data.len) {
-        result.payload = data[offset..];
-    }
+    // Payload, trimmed to the UDP length field so Ethernet padding on small
+    // frames is not treated as UDP payload (and a lying length cannot exceed
+    // the captured bytes). `offset` is past the UDP header here.
+    result.payload = data[offset .. offset + udpPayloadLen(udp.getLength(), data.len - offset)];
 
     return result;
 }
@@ -630,4 +641,30 @@ test "IPv4 checksum calculation" {
 
     // Checksum should be non-zero for this header
     try std.testing.expect(header.checksum != 0);
+}
+
+test "udpPayloadLen trims to declared length and to available bytes" {
+    try std.testing.expectEqual(@as(usize, 4), udpPayloadLen(UDP_HEADER_SIZE + 4, 12)); // padding trimmed
+    try std.testing.expectEqual(@as(usize, 6), udpPayloadLen(UDP_HEADER_SIZE + 100, 6)); // truncated capture
+    try std.testing.expectEqual(@as(usize, 0), udpPayloadLen(0, 10)); // malformed short length
+    try std.testing.expectEqual(@as(usize, 0), udpPayloadLen(UDP_HEADER_SIZE, 10)); // empty payload
+}
+
+test "parsePacket trims payload to UDP length (ignores Ethernet padding)" {
+    // Ethernet + IPv4(20) + UDP(len=8+4) + 4B real payload + 8B Ethernet padding.
+    var raw: [54]u8 = std.mem.zeroes([54]u8);
+    std.mem.writeInt(u16, raw[12..14], @intFromEnum(EtherType.ipv4), .big);
+    raw[14] = (4 << 4) | 5; // IPv4, IHL=5
+    raw[14 + 9] = @intFromEnum(IpProtocol.udp);
+    // UDP header at offset 34; length field covers header + 4 payload bytes.
+    std.mem.writeInt(u16, raw[38..40], UDP_HEADER_SIZE + 4, .big);
+    raw[42] = 'A';
+    raw[43] = 'B';
+    raw[44] = 'C';
+    raw[45] = 'D';
+    // raw[46..54] remain zero -> Ethernet padding that must not be forwarded.
+
+    const parsed = try parsePacket(&raw, .ethernet);
+    try std.testing.expectEqual(@as(usize, 4), parsed.payload.len);
+    try std.testing.expectEqualSlices(u8, "ABCD", parsed.payload);
 }

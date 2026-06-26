@@ -87,6 +87,15 @@ var log_file: ?std.Io.File = null;
 var log_mutex: std.Io.Mutex = std.Io.Mutex.init;
 const default_log_path = "/tmp/udp-proxy-2020.log";
 
+/// A valid `Io` whose futex backs the contended path of the cross-thread
+/// mutexes. The `Threaded` futex ops ignore `userdata` and call real OS
+/// futexes, so the process-wide instance supplies a correct vtable. Passing
+/// `undefined` here (the previous code) dereferenced a garbage vtable the
+/// moment a lock was contended -> crash under concurrent logging.
+pub inline fn syncIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
 fn customLog(
     comptime level: std.log.Level,
     comptime scope: @TypeOf(.enum_literal),
@@ -132,8 +141,8 @@ fn customLog(
     } ++ args) catch return;
 
     // Lock for thread safety and write atomically
-    log_mutex.lockUncancelable(undefined);
-    defer log_mutex.unlock(undefined);
+    log_mutex.lockUncancelable(syncIo());
+    defer log_mutex.unlock(syncIo());
 
     // Write via POSIX fd to avoid requiring io (std.Io.File.write requires io).
     // Loop over partial writes so we don't drop the trailing '\n' and cause
@@ -147,27 +156,14 @@ fn customLog(
     }
 }
 
-fn initLogFile(path: ?[]const u8) !void {
-    const log_path = path orelse default_log_path;
-    var path_buf: [512]u8 = undefined;
-    const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{log_path}) catch return error.PathTooLong;
-    const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0o644));
-    if (fd < 0) return error.FileNotFound;
-    _ = std.c.lseek(fd, 0, std.posix.SEEK.END);
-    log_file = std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
-}
-
 fn initLogFileCreate(path: ?[]const u8) !void {
     const log_path = path orelse default_log_path;
     var path_buf: [512]u8 = undefined;
     const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{log_path}) catch return error.PathTooLong;
-    var fd = std.c.open(path_z.ptr, .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0o644));
-    if (fd < 0) {
-        fd = std.c.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
-        if (fd < 0) return error.OpenFailed;
-    } else {
-        _ = std.c.lseek(fd, 0, std.posix.SEEK.END);
-    }
+    // O_APPEND gives atomic appends (no lseek race) and CREAT without TRUNC
+    // appends to an existing log rather than clobbering it.
+    const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, @as(std.c.mode_t, 0o644));
+    if (fd < 0) return error.OpenFailed;
     log_file = std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
 }
 
@@ -176,6 +172,30 @@ fn deinitLogFile() void {
         _ = std.c.close(f.handle);
         log_file = null;
     }
+}
+
+// ============================================================================
+// Shutdown handling
+// ============================================================================
+
+/// Set by SIGINT/SIGTERM handlers; observed by the main wait loop to trigger a
+/// clean shutdown (stop listeners, join threads, run deinit + leak check).
+var shutdown_requested = std.atomic.Value(bool).init(false);
+
+/// The C signal handler takes the platform's SIG enum (macOS, FreeBSD, Linux
+/// all model it as an enum in Zig 0.16).
+fn handleShutdownSignal(_: std.posix.SIG) callconv(.c) void {
+    shutdown_requested.store(true, .release);
+}
+
+fn installSignalHandlers() void {
+    var act = std.posix.Sigaction{
+        .handler = .{ .handler = handleShutdownSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.INT, &act, null);
+    std.posix.sigaction(std.posix.SIG.TERM, &act, null);
 }
 
 // ============================================================================
@@ -335,7 +355,9 @@ fn runWithThreads(
             .ports = args.ports.items,
             .timeout_ms = args.timeout_ms,
             .cache_ttl_minutes = args.cache_ttl,
-            .fixed_ips = try allocator.dupe([4]u8, fixed_ips.items),
+            // Borrowed: Listener.init copies these into its cache and clears the
+            // reference, so the local ArrayList (freed below) can own them.
+            .fixed_ips = fixed_ips.items,
             .promisc = is_p2p,
             .send_only = false,
             .pcap_debug = args.pcap_debug,
@@ -351,6 +373,11 @@ fn runWithThreads(
         try listeners.append(allocator, listener);
     }
 
+    // The loopback interface name is allocated separately from the args-owned
+    // interface names, so it needs its own cleanup (run after the threads join).
+    var loopback_iface: ?[:0]u8 = null;
+    defer if (loopback_iface) |n| allocator.free(n);
+
     // Add loopback listener if deliver-local is enabled
     if (args.deliver_local) {
         if (try pcap.findLoopback(allocator)) |loopback_name| {
@@ -358,6 +385,7 @@ fn runWithThreads(
 
             const lb_name = try allocator.allocSentinel(u8, loopback_name.len, 0);
             @memcpy(lb_name, loopback_name);
+            loopback_iface = lb_name;
 
             const config = ListenerConfig{
                 .iface_name = lb_name,
@@ -423,10 +451,17 @@ fn runWithThreads(
         try threads.append(allocator, thread);
     }
 
-    // Wait for all threads (they run forever unless stopped)
-    for (threads.items) |thread| {
-        thread.join();
+    // Install signal handlers and block until a shutdown signal arrives. The
+    // listener threads are joined by the deferred cleanup once stop() makes them
+    // observe the change and exit; that cleanup also runs feed/listener/sink
+    // deinit and the GPA leak check, which were previously unreachable.
+    installSignalHandlers();
+    while (!shutdown_requested.load(.acquire)) {
+        const req = std.c.timespec{ .sec = 0, .nsec = 200 * std.time.ns_per_ms }; // 200ms
+        _ = std.c.nanosleep(&req, null);
     }
+    log.info("Shutdown requested; stopping listeners and cleaning up...", .{});
+    for (listeners.items) |*l| l.stop();
 }
 
 fn runListener(listener: *Listener, feed: *sender.SendPktFeed) void {
@@ -447,6 +482,10 @@ fn parseArgs(allocator: std.mem.Allocator, args: *Args, proc_args: std.process.A
             // Handle comma-separated interfaces
             var iface_iter = std.mem.splitScalar(u8, value, ',');
             while (iface_iter.next()) |iface| {
+                if (iface.len == 0) {
+                    log.err("Empty interface name in --interface '{s}'", .{value});
+                    return error.InvalidInterface;
+                }
                 const iface_z = try allocator.allocSentinel(u8, iface.len, 0);
                 @memcpy(iface_z, iface);
                 try args.interfaces.append(allocator, iface_z);
@@ -480,13 +519,22 @@ fn parseArgs(allocator: std.mem.Allocator, args: *Args, proc_args: std.process.A
                 log.err("Invalid port number: {s}", .{value});
                 return error.InvalidPort;
             };
+            if (port == 0) {
+                log.err("Invalid port number: 0 (ports are 1-65535)", .{});
+                return error.InvalidPort;
+            }
             try args.ports.append(allocator, port);
         } else if (std.mem.eql(u8, arg, "-t") or std.mem.eql(u8, arg, "--timeout")) {
             const value = arg_iter.next() orelse return error.MissingValue;
-            args.timeout_ms = std.fmt.parseInt(i32, value, 10) catch {
+            const timeout = std.fmt.parseInt(i32, value, 10) catch {
                 log.err("Invalid timeout: {s}", .{value});
                 return error.InvalidTimeout;
             };
+            if (timeout < 0) {
+                log.err("Invalid timeout (must be >= 0): {s}", .{value});
+                return error.InvalidTimeout;
+            }
+            args.timeout_ms = timeout;
         } else if (std.mem.eql(u8, arg, "-T") or std.mem.eql(u8, arg, "--cache-ttl")) {
             const value = arg_iter.next() orelse return error.MissingValue;
             args.cache_ttl = std.fmt.parseInt(u32, value, 10) catch {

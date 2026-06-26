@@ -12,9 +12,6 @@ const log = std.log.scoped(.bpf);
 // BPF Filter Builder
 // ============================================================================
 
-/// Maximum BPF filter string length
-pub const MAX_FILTER_LEN = 4096;
-
 /// Build a BPF filter string for the given ports and interface addresses
 /// Format: "(udp port X or udp port Y) and (src net A.B.C.D/N or src net E.F.G.H/M)"
 pub fn buildFilter(
@@ -56,6 +53,14 @@ pub fn buildFilter(
 
             // Skip if no prefix (invalid mask)
             if (prefix == 0) continue;
+
+            // BPF "src net X/N" requires a contiguous prefix. A non-contiguous
+            // mask (e.g. 255.0.255.0) cannot be expressed as /N, and
+            // netmaskToPrefix would silently truncate it, so skip it.
+            if (!std.mem.eql(u8, &packet.prefixToNetmask(prefix), &mask)) {
+                log.warn("Skipping non-contiguous netmask {d}.{d}.{d}.{d}", .{ mask[0], mask[1], mask[2], mask[3] });
+                continue;
+            }
 
             // Calculate network address
             const net_addr = packet.calculateNetwork(ip, mask);
@@ -199,6 +204,20 @@ test "buildFilter with multiple addresses" {
     defer allocator.free(filter);
 
     try std.testing.expectEqualStrings("udp port 9003 and (src net 192.168.1.0/24 or src net 10.0.0.0/16)", filter);
+}
+
+test "buildFilter skips non-contiguous netmask" {
+    const allocator = std.testing.allocator;
+    const ports = [_]u16{9003};
+    const addresses = [_]pcap.InterfaceAddress{
+        .{ .addr = [_]u8{ 192, 168, 1, 100 }, .netmask = [_]u8{ 255, 0, 255, 0 } }, // non-contiguous
+    };
+
+    const filter = try buildFilter(allocator, &ports, &addresses);
+    defer allocator.free(filter);
+
+    // The bogus mask is skipped, leaving just the port filter.
+    try std.testing.expectEqualStrings("udp port 9003", filter);
 }
 
 test "buildFilter no ports returns error" {

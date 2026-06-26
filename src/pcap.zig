@@ -80,6 +80,20 @@ extern "c" fn pcap_dump_close(p: *pcap_dumper_t) void;
 extern "c" fn pcap_findalldevs(alldevsp: *?*pcap_if_t, errbuf: [*]u8) c_int;
 extern "c" fn pcap_freealldevs(alldevs: ?*pcap_if_t) void;
 
+// getifaddrs(3) -- used for link-layer (MAC) address discovery, which libpcap
+// does not reliably expose. This struct layout matches macOS/BSD and Linux.
+const ifaddrs = extern struct {
+    next: ?*ifaddrs,
+    name: [*:0]const u8,
+    flags: c_uint,
+    addr: ?*std.posix.sockaddr,
+    netmask: ?*std.posix.sockaddr,
+    dstaddr: ?*std.posix.sockaddr,
+    data: ?*anyopaque,
+};
+extern "c" fn getifaddrs(ifap: *?*ifaddrs) c_int;
+extern "c" fn freeifaddrs(ifa: ?*ifaddrs) void;
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -476,20 +490,31 @@ pub fn findAllDevices(allocator: std.mem.Allocator) ![]Interface {
     }
 
     var interfaces = try allocator.alloc(Interface, count);
-    errdefer allocator.free(interfaces);
-
     var idx: usize = 0;
+    // On a mid-enumeration allocation failure, free the per-element allocations
+    // already stored plus the array itself (the old errdefer freed only the array).
+    errdefer {
+        for (interfaces[0..idx]) |iface| {
+            allocator.free(iface.name);
+            if (iface.description) |d| allocator.free(d);
+            allocator.free(iface.addresses);
+        }
+        allocator.free(interfaces);
+    }
+
     dev = alldevs;
     while (dev) |d| : (dev = d.next) {
         // Copy name
         const name = std.mem.span(d.name);
         const name_copy = try allocator.dupe(u8, name);
+        errdefer allocator.free(name_copy);
 
         // Copy description if present
         var desc_copy: ?[]const u8 = null;
         if (d.description) |desc| {
             desc_copy = try allocator.dupe(u8, std.mem.span(desc));
         }
+        errdefer if (desc_copy) |dc| allocator.free(dc);
 
         // Count and copy addresses
         var addr_count: usize = 0;
@@ -583,16 +608,49 @@ pub fn findLoopback(allocator: std.mem.Allocator) !?[]const u8 {
     return null;
 }
 
+/// Resolve the hardware (MAC) address of an interface by name, or null if it
+/// has none (e.g. loopback) or cannot be determined. Uses getifaddrs(3):
+/// macOS/BSD expose the MAC via an AF_LINK sockaddr_dl, Linux via an AF_PACKET
+/// sockaddr_ll. Both are read by fixed byte offsets to sidestep platform struct
+/// layout differences.
+pub fn getInterfaceMac(iface_name: []const u8) ?[6]u8 {
+    var ifap: ?*ifaddrs = null;
+    if (getifaddrs(&ifap) != 0) return null;
+    defer freeifaddrs(ifap);
+
+    var cur = ifap;
+    while (cur) |ifa| : (cur = ifa.next) {
+        const addr = ifa.addr orelse continue;
+        if (!std.mem.eql(u8, std.mem.span(ifa.name), iface_name)) continue;
+
+        if (comptime builtin.os.tag == .linux) {
+            // sockaddr_ll: sll_halen @ byte 11, sll_addr @ byte 12.
+            if (addr.family != std.posix.AF.PACKET) continue;
+            const raw: [*]const u8 = @ptrCast(addr);
+            if (raw[11] != 6) continue;
+            var mac: [6]u8 = undefined;
+            @memcpy(&mac, raw[12 .. 12 + 6]);
+            return mac;
+        } else {
+            // sockaddr_dl: sdl_nlen @ byte 5, sdl_alen @ byte 6, sdl_data @ 8
+            // (MAC begins after the interface name, i.e. at 8 + sdl_nlen).
+            if (addr.family != std.posix.AF.LINK) continue;
+            const raw: [*]const u8 = @ptrCast(addr);
+            const nlen = raw[5];
+            const alen = raw[6];
+            if (alen != 6) continue;
+            const off: usize = 8 + @as(usize, nlen);
+            var mac: [6]u8 = undefined;
+            @memcpy(&mac, raw[off .. off + 6]);
+            return mac;
+        }
+    }
+    return null;
+}
+
 // ============================================================================
 // Utility Functions
 // ============================================================================
-
-/// Format an IPv4 address as a string
-pub fn formatIpv4(addr: [4]u8) [15:0]u8 {
-    var buf: [15:0]u8 = undefined;
-    _ = std.fmt.bufPrint(&buf, "{d}.{d}.{d}.{d}", .{ addr[0], addr[1], addr[2], addr[3] }) catch unreachable;
-    return buf;
-}
 
 /// Parse an IPv4 address string
 pub fn parseIpv4(str: []const u8) ?[4]u8 {
@@ -632,4 +690,20 @@ test "parseIpv4 invalid" {
     try std.testing.expect(parseIpv4("256.1.1.1") == null);
     try std.testing.expect(parseIpv4("1.2.3") == null);
     try std.testing.expect(parseIpv4("not.an.ip.addr") == null);
+}
+
+test "getInterfaceMac returns null for a nonexistent interface" {
+    try std.testing.expect(getInterfaceMac("nonexistent-iface-zzz999") == null);
+}
+
+test "findAllDevices cleans up on allocation failure" {
+    const Helper = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const ifs = try findAllDevices(allocator);
+            freeDevices(allocator, ifs);
+        }
+    };
+    // Runs findAllDevices with an injected failure at each allocation point and
+    // asserts no leak at any of them (and the success run frees its result).
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Helper.run, .{});
 }
